@@ -10,7 +10,6 @@ import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
 import androidx.core.app.NotificationCompat
-import hevsocks5tunnel.TProxyService
 import java.io.File
 
 class ThrottleVpnService : VpnService() {
