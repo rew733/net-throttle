@@ -11,8 +11,8 @@ import android.os.Build
 import android.os.Bundle
 import android.text.Editable
 import android.text.TextWatcher
-import android.widget.Button
 import android.widget.EditText
+import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
@@ -22,21 +22,24 @@ import androidx.lifecycle.lifecycleScope
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import com.google.android.material.button.MaterialButton
-import com.google.android.material.slider.Slider
+import com.google.android.material.tabs.TabLayout
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 class MainActivity : AppCompatActivity() {
 
-    private val prefs by lazy { getSharedPreferences("net_throttle_prefs", Context.MODE_PRIVATE) }
-    private val selectedPackages = mutableSetOf<String>()
-    private var currentSpeedKbps = 150
-
-    private lateinit var adapter: AppAdapter
     private lateinit var btnToggleVpn: MaterialButton
     private lateinit var tvSpeedValue: TextView
-    private lateinit var sliderSpeed: Slider
+    private lateinit var seekBarSpeed: SeekBar
+    private lateinit var tabLayout: TabLayout
+    private lateinit var etSearch: EditText
+    private lateinit var btnSelectAll: MaterialButton
+    private lateinit var btnDeselectAll: MaterialButton
+    private lateinit var rvApps: RecyclerView
+    private lateinit var adapter: AppAdapter
+
+    private var currentSpeedKbps: Int = 100
 
     private val vpnPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
@@ -44,71 +47,95 @@ class MainActivity : AppCompatActivity() {
         if (result.resultCode == Activity.RESULT_OK) {
             startThrottleService()
         } else {
-            Toast.makeText(this, "يجب الموافقة على إذن VPN لتحديد السرعة", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "يجب منح صلاحية VPN للتشغيل", Toast.LENGTH_SHORT).show()
         }
     }
 
-    private val notificationPermissionLauncher = registerForActivityResult(
+    private val notifPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
-    ) { }
+    ) { _ -> }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-        selectedPackages.addAll(prefs.getStringSet("selected_pkgs", emptySet()) ?: emptySet())
-        currentSpeedKbps = prefs.getInt("speed_kbps", 150)
-
-        tvSpeedValue = findViewById(R.id.tvSpeedValue)
-        sliderSpeed = findViewById(R.id.sliderSpeed)
         btnToggleVpn = findViewById(R.id.btnToggleVpn)
-        val etSearch = findViewById<EditText>(R.id.etSearch)
-        val btnSelectAll = findViewById<Button>(R.id.btnSelectAll)
-        val btnDeselectAll = findViewById<Button>(R.id.btnDeselectAll)
-        val rvApps = findViewById<RecyclerView>(R.id.rvApps)
+        tvSpeedValue = findViewById(R.id.tvSpeedValue)
+        seekBarSpeed = findViewById(R.id.seekBarSpeed)
+        tabLayout = findViewById(R.id.tabLayout)
+        etSearch = findViewById(R.id.etSearch)
+        btnSelectAll = findViewById(R.id.btnSelectAll)
+        btnDeselectAll = findViewById(R.id.btnDeselectAll)
+        rvApps = findViewById(R.id.rvApps)
 
-        sliderSpeed.value = currentSpeedKbps.toFloat().coerceIn(10f, 2000f)
-        tvSpeedValue.text = "$currentSpeedKbps KB/s"
+        val prefs = getSharedPreferences("net_throttle_prefs", Context.MODE_PRIVATE)
+        currentSpeedKbps = prefs.getInt("speed_kbps", 100).coerceIn(10, 1000)
 
-        sliderSpeed.addOnChangeListener { _, value, fromUser ->
-            currentSpeedKbps = value.toInt()
-            tvSpeedValue.text = "$currentSpeedKbps KB/s"
-            prefs.edit().putInt("speed_kbps", currentSpeedKbps).apply()
-
-            if (fromUser && ThrottleVpnService.isRunning) {
-                val updateIntent = Intent(this, ThrottleVpnService::class.java).apply {
-                    action = ThrottleVpnService.ACTION_UPDATE_SPEED
-                    putExtra(ThrottleVpnService.EXTRA_SPEED_KBPS, currentSpeedKbps)
-                }
-                startService(updateIntent)
-            }
+        adapter = AppAdapter {
+            saveSelections()
         }
+        adapter.throttledPackages.addAll(prefs.getStringSet("throttled_pkgs", emptySet()) ?: emptySet())
+        adapter.blockedPackages.addAll(prefs.getStringSet("blocked_pkgs", emptySet()) ?: emptySet())
 
-        adapter = AppAdapter(selectedPackages) {
-            prefs.edit().putStringSet("selected_pkgs", selectedPackages.toSet()).apply()
-        }
         rvApps.layoutManager = LinearLayoutManager(this)
         rvApps.adapter = adapter
+
+        seekBarSpeed.progress = currentSpeedKbps
+        tvSpeedValue.text = "$currentSpeedKbps KB/s"
+
+        seekBarSpeed.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+                currentSpeedKbps = progress.coerceAtLeast(10)
+                tvSpeedValue.text = "$currentSpeedKbps KB/s"
+            }
+
+            override fun onStartTrackingTouch(seekBar: SeekBar?) {}
+
+            override fun onStopTrackingTouch(seekBar: SeekBar?) {
+                prefs.edit().putInt("speed_kbps", currentSpeedKbps).apply()
+                if (ThrottleVpnService.isRunning) {
+                    val intent = Intent(this@MainActivity, ThrottleVpnService::class.java).apply {
+                        action = ThrottleVpnService.ACTION_UPDATE_SPEED
+                        putExtra(ThrottleVpnService.EXTRA_SPEED_KBPS, currentSpeedKbps)
+                    }
+                    startService(intent)
+                }
+            }
+        })
+
+        tabLayout.addOnTabSelectedListener(object : TabLayout.OnTabSelectedListener {
+            override fun onTabSelected(tab: TabLayout.Tab?) {
+                adapter.currentTab = tab?.position ?: 0
+            }
+
+            override fun onTabUnselected(tab: TabLayout.Tab?) {}
+            override fun onTabReselected(tab: TabLayout.Tab?) {}
+        })
 
         etSearch.addTextChangedListener(object : TextWatcher {
             override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
             override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
-                adapter.filter(s?.toString() ?: "")
+                adapter.applyFilter(s?.toString() ?: "")
             }
             override fun afterTextChanged(s: Editable?) {}
         })
 
-        btnSelectAll.setOnClickListener { adapter.selectAllVisible() }
-        btnDeselectAll.setOnClickListener { adapter.deselectAll() }
+        btnSelectAll.setOnClickListener {
+            adapter.selectAllVisible()
+        }
+
+        btnDeselectAll.setOnClickListener {
+            adapter.deselectAllVisible()
+        }
 
         btnToggleVpn.setOnClickListener {
             if (ThrottleVpnService.isRunning) {
-                stopThrottleService()
-            } else {
-                if (selectedPackages.isEmpty()) {
-                    Toast.makeText(this, "اختر تطبيقاً واحداً على الأقل", Toast.LENGTH_SHORT).show()
-                    return@setOnClickListener
+                val intent = Intent(this, ThrottleVpnService::class.java).apply {
+                    action = ThrottleVpnService.ACTION_STOP
                 }
+                startService(intent)
+                btnToggleVpn.postDelayed({ updateToggleButton() }, 300)
+            } else {
                 prepareAndStartVpn()
             }
         }
@@ -119,7 +146,25 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
-        updateButtonState()
+        updateToggleButton()
+    }
+
+    private fun saveSelections() {
+        val prefs = getSharedPreferences("net_throttle_prefs", Context.MODE_PRIVATE)
+        prefs.edit()
+            .putStringSet("throttled_pkgs", adapter.throttledPackages.toSet())
+            .putStringSet("blocked_pkgs", adapter.blockedPackages.toSet())
+            .apply()
+    }
+
+    private fun updateToggleButton() {
+        if (ThrottleVpnService.isRunning) {
+            btnToggleVpn.text = "إيقاف"
+            btnToggleVpn.setBackgroundColor(0xFFE53935.toInt())
+        } else {
+            btnToggleVpn.text = "تشغيل"
+            btnToggleVpn.setBackgroundColor(0xFF1E88E5.toInt())
+        }
     }
 
     private fun requestNotificationPermissionIfNeeded() {
@@ -127,38 +172,19 @@ class MainActivity : AppCompatActivity() {
             if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
                 != PackageManager.PERMISSION_GRANTED
             ) {
-                notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
-            }
-        }
-    }
-
-    private fun loadInstalledApps() {
-        lifecycleScope.launch(Dispatchers.IO) {
-            val pm = packageManager
-            val packages = pm.getInstalledApplications(PackageManager.GET_META_DATA)
-            val appList = packages.mapNotNull { appInfo ->
-                if (appInfo.packageName == packageName) return@mapNotNull null
-                val isUserApp = (appInfo.flags and ApplicationInfo.FLAG_SYSTEM) == 0 ||
-                        (appInfo.flags and ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) != 0
-                if (!isUserApp) return@mapNotNull null
-
-                AppItem(
-                    name = pm.getApplicationLabel(appInfo).toString(),
-                    packageName = appInfo.packageName,
-                    icon = pm.getApplicationIcon(appInfo)
-                )
-            }.sortedBy { it.name.lowercase() }
-
-            withContext(Dispatchers.Main) {
-                adapter.submitList(appList)
+                notifPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
             }
         }
     }
 
     private fun prepareAndStartVpn() {
-        val intent = VpnService.prepare(this)
-        if (intent != null) {
-            vpnPermissionLauncher.launch(intent)
+        if (adapter.throttledPackages.isEmpty() && adapter.blockedPackages.isEmpty()) {
+            Toast.makeText(this, "حدد تطبيقاً واحداً على الأقل للتحديد أو الحظر", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val prepareIntent = VpnService.prepare(this)
+        if (prepareIntent != null) {
+            vpnPermissionLauncher.launch(prepareIntent)
         } else {
             startThrottleService()
         }
@@ -167,26 +193,39 @@ class MainActivity : AppCompatActivity() {
     private fun startThrottleService() {
         val intent = Intent(this, ThrottleVpnService::class.java).apply {
             action = ThrottleVpnService.ACTION_START
-            putStringArrayListExtra(ThrottleVpnService.EXTRA_PACKAGES, ArrayList(selectedPackages))
+            putStringArrayListExtra(ThrottleVpnService.EXTRA_PACKAGES, ArrayList(adapter.throttledPackages))
+            putStringArrayListExtra(ThrottleVpnService.EXTRA_BLOCKED_PACKAGES, ArrayList(adapter.blockedPackages))
             putExtra(ThrottleVpnService.EXTRA_SPEED_KBPS, currentSpeedKbps)
         }
         ContextCompat.startForegroundService(this, intent)
-        btnToggleVpn.postDelayed({ updateButtonState() }, 300)
+        btnToggleVpn.postDelayed({ updateToggleButton() }, 400)
     }
 
-    private fun stopThrottleService() {
-        val intent = Intent(this, ThrottleVpnService::class.java).apply {
-            action = ThrottleVpnService.ACTION_STOP
-        }
-        startService(intent)
-        btnToggleVpn.postDelayed({ updateButtonState() }, 300)
-    }
+    private fun loadInstalledApps() {
+        lifecycleScope.launch {
+            val apps = withContext(Dispatchers.IO) {
+                val pm = packageManager
+                val packages = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    pm.getInstalledApplications(PackageManager.ApplicationInfoFlags.of(0))
+                } else {
+                    @Suppress("DEPRECATION")
+                    pm.getInstalledApplications(0)
+                }
 
-    private fun updateButtonState() {
-        if (ThrottleVpnService.isRunning) {
-            btnToggleVpn.setText(R.string.stop_vpn)
-        } else {
-            btnToggleVpn.setText(R.string.start_vpn)
+                packages.filter { appInfo ->
+                    appInfo.packageName != packageName &&
+                            (appInfo.flags and ApplicationInfo.FLAG_SYSTEM) == 0 &&
+                            pm.getLaunchIntentForPackage(appInfo.packageName) != null
+                }.map { appInfo ->
+                    AppInfo(
+                        name = pm.getApplicationLabel(appInfo).toString(),
+                        packageName = appInfo.packageName,
+                        icon = pm.getApplicationIcon(appInfo),
+                        uid = appInfo.uid
+                    )
+                }.sortedBy { it.name.lowercase() }
+            }
+            adapter.submitList(apps)
         }
     }
 }
