@@ -27,9 +27,6 @@ class LocalSocks5Server(
     private val executor = Executors.newCachedThreadPool()
     private val activeSockets = ConcurrentHashMap.newKeySet<Socket>()
 
-    private val connectRateLock = Object()
-    private var lastConnectTimeMs = 0L
-
     val totalDownloadBytes = AtomicLong(0L)
     val totalUploadBytes = AtomicLong(0L)
     val activeConnections = AtomicInteger(0)
@@ -58,7 +55,7 @@ class LocalSocks5Server(
                     client.tcpNoDelay = true
                     client.receiveBufferSize = 1024
                     client.sendBufferSize = 1024
-                    client.soTimeout = 20000
+                    client.soTimeout = 25000
                     activeSockets.add(client)
                     executor.execute { handleClient(client) }
                 } catch (e: Exception) {
@@ -94,21 +91,6 @@ class LocalSocks5Server(
         } catch (_: Exception) {
         }
         serverSocket = null
-    }
-
-    private fun paceNewConnection() {
-        synchronized(connectRateLock) {
-            val now = System.currentTimeMillis()
-            val elapsed = now - lastConnectTimeMs
-            if (elapsed < 150L) {
-                try {
-                    Thread.sleep(150L - elapsed)
-                } catch (_: InterruptedException) {
-                    Thread.currentThread().interrupt()
-                }
-            }
-            lastConnectTimeMs = System.currentTimeMillis()
-        }
     }
 
     private fun handleClient(client: Socket) {
@@ -192,19 +174,17 @@ class LocalSocks5Server(
     ) {
         if (!running || client.isClosed) return
 
-        paceNewConnection()
-
         val remote = Socket()
         activeSockets.add(remote)
         try {
-            downloadLimiter.consume(2500)
+            downloadLimiter.consume(2000)
 
             vpnService.protect(remote)
             remote.tcpNoDelay = true
             remote.receiveBufferSize = 1024
             remote.sendBufferSize = 1024
-            remote.soTimeout = 15000
-            remote.connect(InetSocketAddress(host, port), 8000)
+            remote.soTimeout = 20000
+            remote.connect(InetSocketAddress(host, port), 10000)
 
             clientOut.write(byteArrayOf(0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
             clientOut.flush()
@@ -282,8 +262,8 @@ class LocalSocks5Server(
         clientOut: OutputStream
     ) {
         val udpRelay = DatagramSocket(0, InetAddress.getByName("127.0.0.1")).apply {
-            receiveBufferSize = 2048
-            sendBufferSize = 2048
+            receiveBufferSize = 1024
+            sendBufferSize = 1024
         }
         val relayPort = udpRelay.localPort
 
@@ -334,15 +314,17 @@ class LocalSocks5Server(
 
                         val payload = buf.copyOfRange(offset, len)
 
+                        // خنق طلبات UDP الصادرة بمقدار مضاعف (×4) قبل إرسالها للإنترنت
+                        // لمنع الخادم البعيد من إغراق البطاقة بحزم الفيديو
                         if (destPort != 53) {
-                            udpLimiter.consume(payload.size)
+                            udpLimiter.consume(payload.size * 4)
                             totalUploadBytes.addAndGet(payload.size.toLong())
                         }
 
                         val outSock = DatagramSocket().apply {
                             receiveBufferSize = 1024
                             sendBufferSize = 1024
-                            soTimeout = 5000
+                            soTimeout = 4000
                         }
                         vpnService.protect(outSock)
                         executor.execute {
