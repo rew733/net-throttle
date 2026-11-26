@@ -34,7 +34,6 @@ class ThrottleVpnService : VpnService() {
     private val downloadLimiter = TokenBucketLimiter(150 * 1024L)
     private val uploadLimiter = TokenBucketLimiter(150 * 1024L)
     private var socksServer: LocalSocks5Server? = null
-    private var tunnelThread: Thread? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
@@ -97,7 +96,6 @@ class ThrottleVpnService : VpnService() {
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("NetThrottle VPN")
             .setContentText(text)
-            .setStyle(NotificationCompat.BigTextStyle().bigText(text))
             .setSmallIcon(android.R.drawable.stat_sys_download)
             .setContentIntent(openIntent)
             .addAction(android.R.drawable.ic_media_pause, "إيقاف", stopIntent)
@@ -107,11 +105,6 @@ class ThrottleVpnService : VpnService() {
 
     private fun startVpn(targetPackages: List<String>, kbps: Int) {
         stopVpnInternal()
-
-        if (TProxyService.loadError != null) {
-            updateNotification("خطأ مكتبة: ${TProxyService.loadError}")
-            return
-        }
 
         try {
             val server = LocalSocks5Server(this, downloadLimiter, uploadLimiter)
@@ -148,40 +141,35 @@ class ThrottleVpnService : VpnService() {
             }
             vpnInterface = pfd
 
+            // الصيغة الرسمية المعتمدة لملف تهيئة hev-socks5-tunnel
             val configFile = File(cacheDir, "tproxy.conf")
             configFile.writeText(
                 """
-                misc:
-                  task-stack-size: 81920
                 tunnel:
+                  name: tun0
                   mtu: 1500
+                  multi-queue: false
+                  ipv4: 10.0.0.2
                 socks5:
                   port: ${server.port}
                   address: 127.0.0.1
                   udp: 'udp'
+                misc:
+                  task-stack-size: 81920
+                  tcp-buffer-size: 65536
+                  connect-timeout: 5000
+                  read-write-timeout: 60000
+                  log-level: warn
                 """.trimIndent()
             )
 
+            // TProxyStartService ينشئ خيطه الداخلي تلقائياً في C ولا يحظر الخيط الرئيسي
+            TProxyService.TProxyStartService(configFile.absolutePath, pfd.fd)
             isRunning = true
             updateNotification("الحد الأقصى الحالي: $kbps KB/s")
-
-            val tunFd = pfd.fd
-            val configPath = configFile.absolutePath
-
-            tunnelThread = Thread {
-                try {
-                    TProxyService.TProxyStartService(configPath, tunFd)
-                } catch (t: Throwable) {
-                    isRunning = false
-                    updateNotification("خطأ تشغيل المحرك: ${t.javaClass.simpleName}: ${t.message}")
-                }
-            }.apply {
-                name = "HevSocks5TunnelThread"
-                start()
-            }
         } catch (t: Throwable) {
             isRunning = false
-            updateNotification("خطأ عام: ${t.javaClass.simpleName}: ${t.message}")
+            updateNotification("خطأ: ${t.javaClass.simpleName}: ${t.message}")
         }
     }
 
@@ -193,7 +181,6 @@ class ThrottleVpnService : VpnService() {
             }
         }
         isRunning = false
-        tunnelThread = null
         socksServer?.stop()
         socksServer = null
         try {
