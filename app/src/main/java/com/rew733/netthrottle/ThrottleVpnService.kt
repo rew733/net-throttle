@@ -122,13 +122,12 @@ class ThrottleVpnService : VpnService() {
     private fun startVpn(targetPackages: List<String>) {
         stopVpnInternal()
 
+        // تعريف IPv4 فقط يجعل أندرويد يوجه حركة التطبيقات المحددة عبر IPv4 تلقائياً دون تعليق IPv6
         val builder = Builder()
             .setSession("NetThrottle")
-            .setMtu(1360)
+            .setMtu(1400)
             .addAddress("10.0.0.2", 32)
             .addRoute("0.0.0.0", 0)
-            .addAddress("fd00:1:fd00:1:fd00:1:fd00:2", 128)
-            .addRoute("::", 0)
             .addDnsServer("8.8.8.8")
             .addDnsServer("1.1.1.1")
 
@@ -176,7 +175,6 @@ class ThrottleVpnService : VpnService() {
     private fun handleOutgoingIpPacket(raw: ByteArray, tunOut: FileOutputStream) {
         if (raw.size < 20) return
         val version = (raw[0].toInt() shr 4) and 0x0F
-        // إسقاط IPv6 بصمت لإجبار التطبيقات على العمل عبر IPv4 المحكوم
         if (version != 4) return
 
         val ihl = (raw[0].toInt() and 0x0F) * 4
@@ -203,8 +201,17 @@ class ThrottleVpnService : VpnService() {
         val srcPort = ((raw[ihl].toInt() and 0xFF) shl 8) or (raw[ihl + 1].toInt() and 0xFF)
         val dstPort = ((raw[ihl + 2].toInt() and 0xFF) shl 8) or (raw[ihl + 3].toInt() and 0xFF)
 
-        // حظر بروتوكول QUIC (UDP 443) لإجبار التطبيقات على التحول إلى TCP القياسي
-        if (dstPort == 443 || dstPort == 80) return
+        // إرسال رفض ICMP فوري لبروتوكول QUIC (UDP 443) للتحويل الفوري إلى TCP دون انتظار مهلة
+        if (dstPort == 443 || dstPort == 80) {
+            val icmpUnreachable = buildIcmpPortUnreachable(dstIp, srcIp, raw)
+            synchronized(tunOut) {
+                try {
+                    tunOut.write(icmpUnreachable)
+                } catch (_: Exception) {
+                }
+            }
+            return
+        }
 
         val udpLen = ((raw[ihl + 4].toInt() and 0xFF) shl 8) or (raw[ihl + 5].toInt() and 0xFF)
         val payloadOffset = ihl + 8
@@ -223,7 +230,7 @@ class ThrottleVpnService : VpnService() {
                 if (socket == null || socket.isClosed) {
                     socket = DatagramSocket()
                     protect(socket)
-                    socket.soTimeout = 10000
+                    socket.soTimeout = 12000
                     udpSockets[key] = socket
 
                     val activeSocket = socket
@@ -311,8 +318,7 @@ class ThrottleVpnService : VpnService() {
     }
 
     private fun computeAdaptiveWindow(): Int {
-        // نافذة صغيرة تمنع الخادم من ضخ بيانات زائدة وتجبره على خفض جودة الفيديو فوراً
-        return (currentSpeedKbps * 16).coerceIn(1024, 16384)
+        return (currentSpeedKbps * 48).coerceIn(4096, 32768)
     }
 
     private inner class TcpSession(
@@ -329,14 +335,14 @@ class ThrottleVpnService : VpnService() {
         private var serverSeq: Long = (System.nanoTime() and 0x7FFFFFFFL)
         @Volatile
         private var closed = false
+        private var totalDownloadedInSession: Long = 0L
 
         fun connect() {
             try {
                 val s = Socket()
                 protect(s)
                 s.tcpNoDelay = true
-                // تقليص مخزن الاستقبال في النظام لمنع سحب بيانات زائدة من الشبكة
-                s.receiveBufferSize = 2048
+                s.receiveBufferSize = 4096
                 s.connect(InetSocketAddress(InetAddress.getByAddress(serverIp), serverPort), 8000)
                 socket = s
 
@@ -348,7 +354,7 @@ class ThrottleVpnService : VpnService() {
                 writeToTun(synAck)
 
                 val inStream = s.getInputStream()
-                val buf = ByteArray(512)
+                val buf = ByteArray(1024)
                 while (isRunning && !closed && !s.isClosed) {
                     val read = inStream.read(buf)
                     if (read == -1) {
@@ -362,7 +368,11 @@ class ThrottleVpnService : VpnService() {
                     }
                     if (read > 0) {
                         val chunk = buf.copyOf(read)
-                        downloadLimiter.consume(chunk.size)
+                        totalDownloadedInSession += chunk.size
+                        // السماح لأول 24KB بالمرور فوراً لإتمام مصافحة TLS وتحميل واجهة التطبيق دون تعليق
+                        if (totalDownloadedInSession > 24576L) {
+                            downloadLimiter.consume(chunk.size)
+                        }
                         val dataPkt = buildIpv4TcpPacket(
                             serverIp, clientIp, serverPort, clientPort,
                             serverSeq, clientNextSeq, 0x18, chunk
@@ -437,6 +447,42 @@ class ThrottleVpnService : VpnService() {
             } catch (_: Exception) {
             }
         }
+    }
+
+    private fun buildIcmpPortUnreachable(
+        srcIp: ByteArray,
+        dstIp: ByteArray,
+        originalIpPacket: ByteArray
+    ): ByteArray {
+        val copyLen = originalIpPacket.size.coerceAtMost(28)
+        val icmpLen = 8 + copyLen
+        val totalLen = 20 + icmpLen
+        val buf = ByteBuffer.allocate(totalLen)
+
+        buf.put(0x45.toByte())
+        buf.put(0x00.toByte())
+        buf.putShort(totalLen.toShort())
+        buf.putShort(0)
+        buf.putShort(0x4000.toShort())
+        buf.put(64.toByte())
+        buf.put(1.toByte()) // ICMP
+        buf.putShort(0)
+        buf.put(srcIp)
+        buf.put(dstIp)
+
+        val ipChecksum = computeChecksum(buf.array(), 0, 20)
+        buf.putShort(10, ipChecksum)
+
+        buf.put(3.toByte()) // Destination Unreachable
+        buf.put(3.toByte()) // Port Unreachable
+        buf.putShort(0) // Checksum placeholder
+        buf.putInt(0) // Unused
+        buf.put(originalIpPacket, 0, copyLen)
+
+        val icmpChecksum = computeChecksum(buf.array(), 20, icmpLen)
+        buf.putShort(22, icmpChecksum)
+
+        return buf.array()
     }
 
     private fun buildIpv4UdpPacket(
