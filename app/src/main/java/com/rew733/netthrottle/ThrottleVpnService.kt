@@ -5,6 +5,7 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.net.VpnService
 import android.os.Build
@@ -20,6 +21,7 @@ class ThrottleVpnService : VpnService() {
         const val ACTION_STOP = "com.rew733.netthrottle.STOP"
         const val ACTION_UPDATE_SPEED = "com.rew733.netthrottle.UPDATE_SPEED"
         const val EXTRA_PACKAGES = "extra_packages"
+        const val EXTRA_BLOCKED_PACKAGES = "extra_blocked_packages"
         const val EXTRA_SPEED_KBPS = "extra_speed_kbps"
 
         @Volatile
@@ -31,8 +33,8 @@ class ThrottleVpnService : VpnService() {
     }
 
     private var vpnInterface: ParcelFileDescriptor? = null
-    private val downloadLimiter = TokenBucketLimiter(150 * 1024L)
-    private val uploadLimiter = TokenBucketLimiter(150 * 1024L)
+    private val downloadLimiter = TokenBucketLimiter(100 * 1024L)
+    private val uploadLimiter = TokenBucketLimiter(100 * 1024L)
     private var socksServer: LocalSocks5Server? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -42,21 +44,22 @@ class ThrottleVpnService : VpnService() {
                 return START_NOT_STICKY
             }
             ACTION_UPDATE_SPEED -> {
-                val kbps = intent.getIntExtra(EXTRA_SPEED_KBPS, 150)
+                val kbps = intent.getIntExtra(EXTRA_SPEED_KBPS, 100)
                 val bytesPerSec = kbps * 1024L
                 downloadLimiter.updateRate(bytesPerSec)
                 uploadLimiter.updateRate(bytesPerSec)
-                updateNotification("الحد الأقصى الحالي: $kbps KB/s")
+                updateNotification("الحد: $kbps KB/s")
                 return START_STICKY
             }
             ACTION_START -> {
-                val packages = intent.getStringArrayListExtra(EXTRA_PACKAGES) ?: arrayListOf()
-                val kbps = intent.getIntExtra(EXTRA_SPEED_KBPS, 150)
+                val throttled = intent.getStringArrayListExtra(EXTRA_PACKAGES) ?: arrayListOf()
+                val blocked = intent.getStringArrayListExtra(EXTRA_BLOCKED_PACKAGES) ?: arrayListOf()
+                val kbps = intent.getIntExtra(EXTRA_SPEED_KBPS, 100)
                 val bytesPerSec = kbps * 1024L
                 downloadLimiter.updateRate(bytesPerSec)
                 uploadLimiter.updateRate(bytesPerSec)
-                startForegroundServiceWithNotification("جاري التشغيل ($kbps KB/s)...")
-                startVpn(packages, kbps)
+                startForegroundServiceWithNotification("جاري التشغيل...")
+                startVpn(throttled, blocked, kbps)
             }
         }
         return START_STICKY
@@ -94,7 +97,7 @@ class ThrottleVpnService : VpnService() {
             PendingIntent.FLAG_IMMUTABLE
         )
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("NetThrottle VPN")
+            .setContentTitle("NetThrottle نشط")
             .setContentText(text)
             .setSmallIcon(android.R.drawable.stat_sys_download)
             .setContentIntent(openIntent)
@@ -103,11 +106,35 @@ class ThrottleVpnService : VpnService() {
             .build()
     }
 
-    private fun startVpn(targetPackages: List<String>, kbps: Int) {
+    private fun resolveBlockedUids(blockedPackages: List<String>): Set<Int> {
+        val uids = mutableSetOf<Int>()
+        for (pkg in blockedPackages) {
+            try {
+                val appInfo = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    packageManager.getApplicationInfo(pkg, PackageManager.ApplicationInfoFlags.of(0))
+                } else {
+                    @Suppress("DEPRECATION")
+                    packageManager.getApplicationInfo(pkg, 0)
+                }
+                if (appInfo.uid > 0) {
+                    uids.add(appInfo.uid)
+                }
+            } catch (_: Exception) {
+            }
+        }
+        return uids
+    }
+
+    private fun startVpn(
+        throttledPackages: List<String>,
+        blockedPackages: List<String>,
+        kbps: Int
+    ) {
         stopVpnInternal()
 
         try {
             val server = LocalSocks5Server(this, downloadLimiter, uploadLimiter)
+            server.blockedUids = resolveBlockedUids(blockedPackages)
             server.start()
             socksServer = server
 
@@ -119,8 +146,9 @@ class ThrottleVpnService : VpnService() {
                 .addDnsServer("8.8.8.8")
                 .addDnsServer("1.1.1.1")
 
+            val allManagedPackages = (throttledPackages + blockedPackages).distinct()
             var addedCount = 0
-            for (pkg in targetPackages) {
+            for (pkg in allManagedPackages) {
                 if (pkg == packageName) continue
                 try {
                     builder.addAllowedApplication(pkg)
@@ -141,7 +169,6 @@ class ThrottleVpnService : VpnService() {
             }
             vpnInterface = pfd
 
-            // الصيغة الرسمية المعتمدة لملف تهيئة hev-socks5-tunnel
             val configFile = File(cacheDir, "tproxy.conf")
             configFile.writeText(
                 """
@@ -156,17 +183,16 @@ class ThrottleVpnService : VpnService() {
                   udp: 'udp'
                 misc:
                   task-stack-size: 81920
-                  tcp-buffer-size: 65536
+                  tcp-buffer-size: 4096
                   connect-timeout: 5000
                   read-write-timeout: 60000
                   log-level: warn
                 """.trimIndent()
             )
 
-            // TProxyStartService ينشئ خيطه الداخلي تلقائياً في C ولا يحظر الخيط الرئيسي
             TProxyService.TProxyStartService(configFile.absolutePath, pfd.fd)
             isRunning = true
-            updateNotification("الحد الأقصى الحالي: $kbps KB/s")
+            updateNotification("الحد: $kbps KB/s | محظور: ${blockedPackages.size} تطبيق")
         } catch (t: Throwable) {
             isRunning = false
             updateNotification("خطأ: ${t.javaClass.simpleName}: ${t.message}")
