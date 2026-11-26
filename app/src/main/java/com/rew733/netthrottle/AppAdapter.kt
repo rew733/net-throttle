@@ -1,5 +1,6 @@
 package com.rew733.netthrottle
 
+import android.graphics.drawable.Drawable
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
@@ -7,6 +8,13 @@ import android.widget.CheckBox
 import android.widget.ImageView
 import android.widget.TextView
 import androidx.recyclerview.widget.RecyclerView
+
+data class AppInfo(
+    val name: String,
+    val packageName: String,
+    val icon: Drawable,
+    val uid: Int
+)
 
 class AppAdapter(
     private val onSelectionChanged: () -> Unit
@@ -75,14 +83,14 @@ class AppAdapter(
 
         val targetSet = if (currentTab == 0) throttledPackages else blockedPackages
 
-        holder.cbAppSelect.setOnCheckedChangeListener(null)
-        holder.cbAppSelect.isChecked = targetSet.contains(app.packageName)
+        holder.checkBox.setOnCheckedChangeListener(null)
+        holder.checkBox.isChecked = targetSet.contains(app.packageName)
 
         holder.itemView.setOnClickListener {
-            holder.cbAppSelect.isChecked = !holder.cbAppSelect.isChecked
+            holder.checkBox.isChecked = !holder.checkBox.isChecked
         }
 
-        holder.cbAppSelect.setOnCheckedChangeListener { _, isChecked ->
+        holder.checkBox.setOnCheckedChangeListener { _, isChecked ->
             if (isChecked) {
                 targetSet.add(app.packageName)
             } else {
@@ -95,9 +103,39 @@ class AppAdapter(
     override fun getItemCount(): Int = filteredApps.size
 
     class AppViewHolder(view: View) : RecyclerView.ViewHolder(view) {
-        val ivAppIcon: ImageView = view.findViewById(R.id.ivAppIcon)
-        val tvAppName: TextView = view.findViewById(R.id.tvAppName)
-        val tvPackageName: TextView = view.findViewById(R.id.tvPackageName)
-        val cbAppSelect: CheckBox = view.findViewById(R.id.cbAppSelect)
+        val ivAppIcon: ImageView = findViewByType(view, ImageView::class.java)!!
+        val checkBox: CheckBox = findViewByType(view, CheckBox::class.java)!!
+        val tvAppName: TextView
+        val tvPackageName: TextView
+
+        init {
+            val textViews = mutableListOf<TextView>()
+            collectTextViews(view, textViews)
+            tvAppName = textViews.getOrElse(0) { TextView(view.context) }
+            tvPackageName = textViews.getOrElse(1) { tvAppName }
+        }
+
+        companion object {
+            private fun <T : View> findViewByType(root: View, clazz: Class<T>): T? {
+                if (clazz.isInstance(root)) return clazz.cast(root)
+                if (root is ViewGroup) {
+                    for (i in 0 until root.childCount) {
+                        val found = findViewByType(root.getChildAt(i), clazz)
+                        if (found != null) return found
+                    }
+                }
+                return null
+            }
+
+            private fun collectTextViews(root: View, out: MutableList<TextView>) {
+                if (root is TextView && root !is CheckBox) {
+                    out.add(root)
+                } else if (root is ViewGroup) {
+                    for (i in 0 until root.childCount) {
+                        collectTextViews(root.getChildAt(i), out)
+                    }
+                }
+            }
+        }
     }
 }
