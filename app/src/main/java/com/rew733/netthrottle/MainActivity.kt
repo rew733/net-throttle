@@ -7,7 +7,6 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
-import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.net.VpnService
 import android.os.Build
@@ -329,9 +328,10 @@ class MainActivity : AppCompatActivity() {
                 }
 
                 packages.filter { appInfo ->
-                    appInfo.packageName != packageName &&
-                            (appInfo.flags and ApplicationInfo.FLAG_SYSTEM) == 0 &&
-                            pm.getLaunchIntentForPackage(appInfo.packageName) != null
+                    val pkg = appInfo.packageName
+                    pkg != packageName &&
+                            !ThrottleVpnService.isProtectedSystemPackage(pkg) &&
+                            pm.getLaunchIntentForPackage(pkg) != null
                 }.map { appInfo ->
                     AppInfo(
                         name = pm.getApplicationLabel(appInfo).toString(),
