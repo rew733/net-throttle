@@ -80,15 +80,15 @@ class AppAdapter(
 
     override fun onBindViewHolder(holder: AppViewHolder, position: Int) {
         val app = filteredApps[position]
-        holder.tvName.text = app.name
-        holder.tvPkg.text = app.packageName
-        holder.ivIcon.setImageDrawable(app.icon)
+        holder.tvName?.text = app.name
+        holder.tvPkg?.text = app.packageName
+        holder.ivIcon?.setImageDrawable(app.icon)
 
         val targetSet = if (currentTab == 0) throttledPackages else blockedPackages
         val oppositeSet = if (currentTab == 0) blockedPackages else throttledPackages
 
-        holder.cbSelected.setOnCheckedChangeListener(null)
-        holder.cbSelected.isChecked = targetSet.contains(app.packageName)
+        holder.cbSelected?.setOnCheckedChangeListener(null)
+        holder.cbSelected?.isChecked = targetSet.contains(app.packageName)
 
         val toggleAction = {
             val newState = !targetSet.contains(app.packageName)
@@ -98,20 +98,50 @@ class AppAdapter(
             } else {
                 targetSet.remove(app.packageName)
             }
-            holder.cbSelected.isChecked = newState
+            holder.cbSelected?.isChecked = newState
             onSelectionChanged()
         }
 
         holder.itemView.setOnClickListener { toggleAction() }
-        holder.cbSelected.setOnClickListener { toggleAction() }
+        holder.cbSelected?.setOnClickListener { toggleAction() }
     }
 
     override fun getItemCount(): Int = filteredApps.size
 
     class AppViewHolder(view: View) : RecyclerView.ViewHolder(view) {
-        val ivIcon: ImageView = view.findViewById(R.id.ivAppIcon)
-        val tvName: TextView = view.findViewById(R.id.tvAppName)
-        val tvPkg: TextView = view.findViewById(R.id.tvPackageName)
-        val cbSelected: CheckBox = view.findViewById(R.id.cbAppSelected)
+        val ivIcon: ImageView? = findFirstViewOfType(view, ImageView::class.java)
+        val cbSelected: CheckBox? = findFirstViewOfType(view, CheckBox::class.java)
+        val tvName: TextView?
+        val tvPkg: TextView?
+
+        init {
+            val textViews = mutableListOf<TextView>()
+            collectTextViews(view, textViews)
+            tvName = textViews.getOrNull(0)
+            tvPkg = textViews.getOrNull(1)
+        }
+
+        companion object {
+            private fun <T : View> findFirstViewOfType(root: View, clazz: Class<T>): T? {
+                if (clazz.isInstance(root)) return clazz.cast(root)
+                if (root is ViewGroup) {
+                    for (i in 0 until root.childCount) {
+                        val found = findFirstViewOfType(root.getChildAt(i), clazz)
+                        if (found != null) return found
+                    }
+                }
+                return null
+            }
+
+            private fun collectTextViews(root: View, out: MutableList<TextView>) {
+                if (root is TextView && root !is CheckBox) {
+                    out.add(root)
+                } else if (root is ViewGroup) {
+                    for (i in 0 until root.childCount) {
+                        collectTextViews(root.getChildAt(i), out)
+                    }
+                }
+            }
+        }
     }
 }
