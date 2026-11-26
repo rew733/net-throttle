@@ -20,13 +20,13 @@ import java.util.concurrent.atomic.AtomicLong
 class LocalSocks5Server(
     private val vpnService: VpnService,
     private val downloadLimiter: TokenBucketLimiter,
-    private val uploadLimiter: TokenBucketLimiter
+    private val uploadLimiter: TokenBucketLimiter,
+    private val udpLimiter: TokenBucketLimiter
 ) {
     private var serverSocket: ServerSocket? = null
     private val executor = Executors.newCachedThreadPool()
     private val activeSockets = ConcurrentHashMap.newKeySet<Socket>()
 
-    // تنظيم معدل فتح الاتصالات الجديدة لمنع انفجار مصافحات TLS دون حجز المقابس المفتوحة
     private val connectRateLock = Object()
     private var lastConnectTimeMs = 0L
 
@@ -192,20 +192,18 @@ class LocalSocks5Server(
     ) {
         if (!running || client.isClosed) return
 
-        // تباعد زمني بسيط بين فتح الاتصالات الجديدة لمنع انفجار مصافحات TLS
         paceNewConnection()
 
         val remote = Socket()
         activeSockets.add(remote)
         try {
-            // احتساب تكلفة مصافحة TLS و SYN/ACK (حوالي 2.5 KB)
             downloadLimiter.consume(2500)
 
             vpnService.protect(remote)
             remote.tcpNoDelay = true
             remote.receiveBufferSize = 1024
             remote.sendBufferSize = 1024
-            remote.soTimeout = 15000 // إغلاق تلقائي لأي اتصال خامل لأكثر من 15 ثانية
+            remote.soTimeout = 15000
             remote.connect(InetSocketAddress(host, port), 8000)
 
             clientOut.write(byteArrayOf(0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
@@ -283,7 +281,10 @@ class LocalSocks5Server(
         clientIn: InputStream,
         clientOut: OutputStream
     ) {
-        val udpRelay = DatagramSocket(0, InetAddress.getByName("127.0.0.1"))
+        val udpRelay = DatagramSocket(0, InetAddress.getByName("127.0.0.1")).apply {
+            receiveBufferSize = 2048
+            sendBufferSize = 2048
+        }
         val relayPort = udpRelay.localPort
 
         val reply = ByteBuffer.allocate(10).apply {
@@ -299,7 +300,7 @@ class LocalSocks5Server(
         clientOut.flush()
 
         executor.execute {
-            val buf = ByteArray(2048)
+            val buf = ByteArray(1500)
             val packet = DatagramPacket(buf, buf.size)
             var clientAppAddr: InetSocketAddress? = null
 
@@ -331,26 +332,29 @@ class LocalSocks5Server(
                         val destPort = ((buf[offset].toInt() and 0xFF) shl 8) or (buf[offset + 1].toInt() and 0xFF)
                         offset += 2
 
-                        if (destPort == 443 || destPort == 80) continue
-
                         val payload = buf.copyOfRange(offset, len)
+
+                        // تقييد حزم UDP / QUIC (بما فيها المنفذ 443 و 80) عبر المحدد المستقل udpLimiter
                         if (destPort != 53) {
-                            uploadLimiter.consume(payload.size)
+                            udpLimiter.consume(payload.size)
                             totalUploadBytes.addAndGet(payload.size.toLong())
                         }
 
-                        val outSock = DatagramSocket()
+                        val outSock = DatagramSocket().apply {
+                            receiveBufferSize = 1024
+                            sendBufferSize = 1024
+                            soTimeout = 5000
+                        }
                         vpnService.protect(outSock)
-                        outSock.soTimeout = 5000
                         executor.execute {
                             try {
                                 outSock.send(DatagramPacket(payload, payload.size, destAddr, destPort))
-                                val rBuf = ByteArray(2048)
+                                val rBuf = ByteArray(1500)
                                 val rPkt = DatagramPacket(rBuf, rBuf.size)
                                 outSock.receive(rPkt)
                                 val rData = rPkt.data.copyOf(rPkt.length)
                                 if (destPort != 53) {
-                                    downloadLimiter.consume(rData.size)
+                                    udpLimiter.consume(rData.size)
                                     totalDownloadBytes.addAndGet(rData.size.toLong())
                                 }
 
