@@ -11,9 +11,8 @@ import android.os.Build
 import android.os.Bundle
 import android.text.Editable
 import android.text.TextWatcher
+import android.view.inputmethod.InputMethodManager
 import android.widget.EditText
-import android.widget.SeekBar
-import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
@@ -29,9 +28,10 @@ import kotlinx.coroutines.withContext
 
 class MainActivity : AppCompatActivity() {
 
+    private lateinit var btnRefresh: MaterialButton
     private lateinit var btnToggleVpn: MaterialButton
-    private lateinit var tvSpeedValue: TextView
-    private lateinit var seekBarSpeed: SeekBar
+    private lateinit var etSpeedInput: EditText
+    private lateinit var btnApplySpeed: MaterialButton
     private lateinit var tabLayout: TabLayout
     private lateinit var etSearch: EditText
     private lateinit var btnSelectAll: MaterialButton
@@ -59,9 +59,10 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
+        btnRefresh = findViewById(R.id.btnRefresh)
         btnToggleVpn = findViewById(R.id.btnToggleVpn)
-        tvSpeedValue = findViewById(R.id.tvSpeedValue)
-        seekBarSpeed = findViewById(R.id.seekBarSpeed)
+        etSpeedInput = findViewById(R.id.etSpeedInput)
+        btnApplySpeed = findViewById(R.id.btnApplySpeed)
         tabLayout = findViewById(R.id.tabLayout)
         etSearch = findViewById(R.id.etSearch)
         btnSelectAll = findViewById(R.id.btnSelectAll)
@@ -69,7 +70,7 @@ class MainActivity : AppCompatActivity() {
         rvApps = findViewById(R.id.rvApps)
 
         val prefs = getSharedPreferences("net_throttle_prefs", Context.MODE_PRIVATE)
-        currentSpeedKbps = prefs.getInt("speed_kbps", 100).coerceIn(10, 1000)
+        currentSpeedKbps = prefs.getInt("speed_kbps", 100).coerceAtLeast(1)
 
         adapter = AppAdapter {
             saveSelections()
@@ -80,28 +81,44 @@ class MainActivity : AppCompatActivity() {
         rvApps.layoutManager = LinearLayoutManager(this)
         rvApps.adapter = adapter
 
-        seekBarSpeed.progress = currentSpeedKbps
-        tvSpeedValue.text = "$currentSpeedKbps KB/s"
+        etSpeedInput.setText(currentSpeedKbps.toString())
 
-        seekBarSpeed.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-            override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
-                currentSpeedKbps = progress.coerceAtLeast(10)
-                tvSpeedValue.text = "$currentSpeedKbps KB/s"
+        btnApplySpeed.setOnClickListener {
+            val enteredText = etSpeedInput.text.toString().trim()
+            val parsed = enteredText.toIntOrNull()
+            if (parsed == null || parsed < 1) {
+                Toast.makeText(this, "أدخل رقماً صحيحاً أكبر من 0", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
             }
+            currentSpeedKbps = parsed
+            prefs.edit().putInt("speed_kbps", currentSpeedKbps).apply()
 
-            override fun onStartTrackingTouch(seekBar: SeekBar?) {}
+            // إخفاء لوحة المفاتيح بعد التطبيق
+            val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+            imm.hideSoftInputFromWindow(etSpeedInput.windowToken, 0)
 
-            override fun onStopTrackingTouch(seekBar: SeekBar?) {
-                prefs.edit().putInt("speed_kbps", currentSpeedKbps).apply()
-                if (ThrottleVpnService.isRunning) {
-                    val intent = Intent(this@MainActivity, ThrottleVpnService::class.java).apply {
-                        action = ThrottleVpnService.ACTION_UPDATE_SPEED
-                        putExtra(ThrottleVpnService.EXTRA_SPEED_KBPS, currentSpeedKbps)
-                    }
-                    startService(intent)
+            if (ThrottleVpnService.isRunning) {
+                val intent = Intent(this, ThrottleVpnService::class.java).apply {
+                    action = ThrottleVpnService.ACTION_UPDATE_SPEED
+                    putExtra(ThrottleVpnService.EXTRA_SPEED_KBPS, currentSpeedKbps)
                 }
+                startService(intent)
             }
-        })
+            Toast.makeText(this, "تم ضبط السرعة على $currentSpeedKbps KB/s", Toast.LENGTH_SHORT).show()
+        }
+
+        btnRefresh.setOnClickListener {
+            loadInstalledApps()
+            if (ThrottleVpnService.isRunning) {
+                val intent = Intent(this, ThrottleVpnService::class.java).apply {
+                    action = ThrottleVpnService.ACTION_REFRESH
+                }
+                startService(intent)
+                Toast.makeText(this, "تم تحديث الاتصالات وتفريغ الذاكرة", Toast.LENGTH_SHORT).show()
+            } else {
+                Toast.makeText(this, "تم تحديث قائمة التطبيقات", Toast.LENGTH_SHORT).show()
+            }
+        }
 
         tabLayout.addOnTabSelectedListener(object : TabLayout.OnTabSelectedListener {
             override fun onTabSelected(tab: TabLayout.Tab?) {
@@ -136,6 +153,12 @@ class MainActivity : AppCompatActivity() {
                 startService(intent)
                 btnToggleVpn.postDelayed({ updateToggleButton() }, 300)
             } else {
+                // قراءة الرقم المكتوب في المربع قبل التشغيل مباشرة
+                val typed = etSpeedInput.text.toString().trim().toIntOrNull()
+                if (typed != null && typed >= 1) {
+                    currentSpeedKbps = typed
+                    prefs.edit().putInt("speed_kbps", currentSpeedKbps).apply()
+                }
                 prepareAndStartVpn()
             }
         }
