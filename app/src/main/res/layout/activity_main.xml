@@ -4,102 +4,146 @@
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:orientation="vertical"
-    android:padding="12dp">
+    android:background="#121212"
+    android:padding="14dp">
 
-    <com.google.android.material.card.MaterialCardView
+    <!-- العنوان وزر التشغيل -->
+    <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_marginBottom="10dp"
-        app:cardCornerRadius="12dp"
-        app:cardElevation="2dp">
+        android:orientation="horizontal"
+        android:gravity="center_vertical"
+        android:paddingBottom="10dp">
+
+        <TextView
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="NetThrottle"
+            android:textColor="#FFFFFF"
+            android:textSize="22sp"
+            android:textStyle="bold" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/btnToggleVpn"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="تشغيل"
+            android:textColor="#FFFFFF"
+            app:backgroundTint="#1E88E5"
+            app:cornerRadius="12dp" />
+    </LinearLayout>
+
+    <!-- شريط التحكم بالسرعة -->
+    <LinearLayout
+        android:id="@+id/speedControlCard"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:background="#1E1E1E"
+        android:padding="12dp"
+        android:layout_marginBottom="10dp">
 
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:orientation="vertical"
-            android:padding="14dp">
+            android:orientation="horizontal"
+            android:gravity="center_vertical">
 
-            <LinearLayout
-                android:layout_width="match_parent"
+            <TextView
+                android:layout_width="0dp"
                 android:layout_height="wrap_content"
-                android:orientation="horizontal">
+                android:layout_weight="1"
+                android:text="الحد الأقصى للسرعة:"
+                android:textColor="#CCCCCC"
+                android:textSize="14sp" />
 
-                <TextView
-                    android:layout_width="0dp"
-                    android:layout_height="wrap_content"
-                    android:layout_weight="1"
-                    android:text="@string/speed_limit_label"
-                    android:textSize="14sp"
-                    android:textStyle="bold" />
-
-                <TextView
-                    android:id="@+id/tvSpeedValue"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="150 KB/s"
-                    android:textColor="?attr/colorPrimary"
-                    android:textSize="15sp"
-                    android:textStyle="bold" />
-            </LinearLayout>
-
-            <com.google.android.material.slider.Slider
-                android:id="@+id/sliderSpeed"
-                android:layout_width="match_parent"
+            <TextView
+                android:id="@+id/tvSpeedValue"
+                android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:stepSize="10.0"
-                android:value="150.0"
-                android:valueFrom="10.0"
-                android:valueTo="2000.0" />
+                android:text="100 KB/s"
+                android:textColor="#4FC3F7"
+                android:textSize="16sp"
+                android:textStyle="bold" />
         </LinearLayout>
-    </com.google.android.material.card.MaterialCardView>
 
-    <EditText
-        android:id="@+id/etSearch"
+        <SeekBar
+            android:id="@+id/seekBarSpeed"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:max="1000"
+            android:progress="100"
+            android:layout_marginTop="6dp" />
+    </LinearLayout>
+
+    <!-- التبويبات: تحديد السرعة / حظر التطبيقات -->
+    <com.google.android.material.tabs.TabLayout
+        android:id="@+id/tabLayout"
         android:layout_width="match_parent"
-        android:layout_height="46dp"
-        android:layout_marginBottom="8dp"
-        android:background="@android:drawable/edit_text"
-        android:hint="@string/search_hint"
-        android:inputType="text"
-        android:maxLines="1"
-        android:paddingHorizontal="12dp" />
+        android:layout_height="wrap_content"
+        android:background="#1E1E1E"
+        app:tabTextColor="#AAAAAA"
+        app:tabSelectedTextColor="#4FC3F7"
+        app:tabIndicatorColor="#4FC3F7"
+        android:layout_marginBottom="8dp">
 
+        <com.google.android.material.tabs.TabItem
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="تحديد السرعة" />
+
+        <com.google.android.material.tabs.TabItem
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="حظر البيانات" />
+    </com.google.android.material.tabs.TabLayout>
+
+    <!-- البحث وأزرار تحديد الكل / إلغاء الكل -->
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_marginBottom="6dp"
-        android:orientation="horizontal">
+        android:orientation="horizontal"
+        android:gravity="center_vertical"
+        android:layout_marginBottom="8dp">
 
-        <Button
+        <EditText
+            android:id="@+id/etSearch"
+            android:layout_width="0dp"
+            android:layout_height="42dp"
+            android:layout_weight="1"
+            android:background="#1E1E1E"
+            android:hint="بحث عن تطبيق..."
+            android:textColorHint="#888888"
+            android:textColor="#FFFFFF"
+            android:paddingHorizontal="12dp"
+            android:textSize="14sp"
+            android:singleLine="true" />
+
+        <com.google.android.material.button.MaterialButton
             android:id="@+id/btnSelectAll"
             style="@style/Widget.Material3.Button.TextButton"
-            android:layout_width="0dp"
+            android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:layout_weight="1"
-            android:text="@string/select_all" />
+            android:text="الكل"
+            android:textColor="#4FC3F7"
+            android:minWidth="48dp" />
 
-        <Button
+        <com.google.android.material.button.MaterialButton
             android:id="@+id/btnDeselectAll"
             style="@style/Widget.Material3.Button.TextButton"
-            android:layout_width="0dp"
+            android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:layout_weight="1"
-            android:text="@string/deselect_all" />
+            android:text="إلغاء"
+            android:textColor="#EF5350"
+            android:minWidth="48dp" />
     </LinearLayout>
 
+    <!-- قائمة التطبيقات -->
     <androidx.recyclerview.widget.RecyclerView
         android:id="@+id/rvApps"
         android:layout_width="match_parent"
         android:layout_height="0dp"
         android:layout_weight="1" />
-
-    <com.google.android.material.button.MaterialButton
-        android:id="@+id/btnToggleVpn"
-        android:layout_width="match_parent"
-        android:layout_height="54dp"
-        android:layout_marginTop="8dp"
-        android:text="@string/start_vpn"
-        android:textSize="16sp"
-        app:cornerRadius="12dp" />
 
 </LinearLayout>
