@@ -8,7 +8,6 @@ import android.app.usage.UsageEvents
 import android.app.usage.UsageStatsManager
 import android.content.Context
 import android.content.Intent
-import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.net.VpnService
@@ -56,6 +55,29 @@ class ThrottleVpnService : VpnService() {
         private const val CHANNEL_ID = "net_throttle_vpn"
         private const val NOTIF_ID = 101
         private const val AUTO_REFRESH_INTERVAL_MS = 15 * 60 * 1000L
+
+        private val PROTECTED_SYSTEM_PREFIXES = listOf(
+            "com.android.settings",
+            "com.android.phone",
+            "com.android.dialer",
+            "com.android.contacts",
+            "com.android.mms",
+            "com.android.messaging",
+            "com.android.camera",
+            "com.android.systemui",
+            "com.android.providers",
+            "com.android.vending",
+            "com.google.android.gms",
+            "com.google.android.gsf",
+            "com.google.android.packageinstaller",
+            "com.google.android.permissioncontroller",
+            "com.motorola."
+        )
+
+        fun isProtectedSystemPackage(pkg: String): Boolean {
+            if (pkg == "android" || pkg.startsWith("android.")) return true
+            return PROTECTED_SYSTEM_PREFIXES.any { pkg.startsWith(it) }
+        }
     }
 
     private var vpnInterface: ParcelFileDescriptor? = null
@@ -67,7 +89,7 @@ class ThrottleVpnService : VpnService() {
     private var routingModeDesc: String = ""
 
     private var foregroundOnlyMode: Boolean = false
-    private var userAppNames: Map<String, String> = emptyMap()
+    private var managedAppNames: Map<String, String> = emptyMap()
     private var lastDetectedActivePkg: String? = null
     private var currentTunnelTargetPkg: String? = "__NONE__"
 
@@ -144,7 +166,7 @@ class ThrottleVpnService : VpnService() {
                 foregroundOnlyMode = intent.getBooleanExtra(EXTRA_FOREGROUND_ONLY_MODE, false)
                 currentKbps = intent.getIntExtra(EXTRA_SPEED_KBPS, 100).coerceAtLeast(1)
                 applySpeedLimits(currentKbps)
-                userAppNames = collectUserPackagesWithLabels()
+                managedAppNames = collectManagedPackagesWithLabels()
                 lastDetectedActivePkg = null
                 currentTunnelTargetPkg = "__NONE__"
                 startForegroundServiceWithNotification("جاري التشغيل...")
@@ -154,7 +176,7 @@ class ThrottleVpnService : VpnService() {
         return START_STICKY
     }
 
-    private fun collectUserPackagesWithLabels(): Map<String, String> {
+    private fun collectManagedPackagesWithLabels(): Map<String, String> {
         val pm = packageManager
         val list = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             pm.getInstalledApplications(PackageManager.ApplicationInfoFlags.of(0))
@@ -164,23 +186,23 @@ class ThrottleVpnService : VpnService() {
         }
         val map = mutableMapOf<String, String>()
         for (info in list) {
-            if (info.packageName != packageName &&
-                (info.flags and ApplicationInfo.FLAG_SYSTEM) == 0 &&
-                pm.getLaunchIntentForPackage(info.packageName) != null
-            ) {
-                map[info.packageName] = pm.getApplicationLabel(info).toString()
+            val pkg = info.packageName
+            if (pkg == packageName) continue
+            if (isProtectedSystemPackage(pkg)) continue
+            if (pm.getLaunchIntentForPackage(pkg) != null) {
+                map[pkg] = pm.getApplicationLabel(info).toString()
             }
         }
         return map
     }
 
-    private fun detectForegroundUserPackage(): String? {
+    private fun detectForegroundManagedPackage(): String? {
         val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
         if (!pm.isInteractive) return null
 
         val usm = getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
         val now = System.currentTimeMillis()
-        val events = usm.queryEvents(now - 120_000L, now)
+        val events = usm.queryEvents(now - 180_000L, now)
         val event = UsageEvents.Event()
         var latestEventPkg: String? = null
         while (events.hasNextEvent()) {
@@ -194,16 +216,16 @@ class ThrottleVpnService : VpnService() {
         lastDetectedActivePkg = candidate
 
         if (candidate == packageName) return null
-        return if (userAppNames.containsKey(candidate)) candidate else null
+        return if (managedAppNames.containsKey(candidate)) candidate else null
     }
 
     private fun monitorAndRouteActiveApp(server: LocalSocks5Server) {
-        val activePkg = detectForegroundUserPackage()
+        val activePkg = detectForegroundManagedPackage()
         server.foregroundOnlyEnabled = true
         server.hasActiveForegroundApp = (activePkg != null)
 
         routingModeDesc = if (activePkg != null) {
-            val label = userAppNames[activePkg] ?: activePkg.substringAfterLast('.')
+            val label = managedAppNames[activePkg] ?: activePkg.substringAfterLast('.')
             "النشط: $label"
         } else {
             "النشط فقط: الخلفية محظورة"
@@ -227,7 +249,7 @@ class ThrottleVpnService : VpnService() {
                 .addDnsServer("8.8.8.8")
                 .addDnsServer("1.1.1.1")
 
-            for (pkg in userAppNames.keys) {
+            for (pkg in managedAppNames.keys) {
                 try {
                     builder.addAllowedApplication(pkg)
                 } catch (_: Exception) {
@@ -350,13 +372,13 @@ class ThrottleVpnService : VpnService() {
                 .addDnsServer("1.1.1.1")
 
             if (foregroundOnlyMode || (throttledPackages.isEmpty() && blockedPackages.isEmpty())) {
-                for (pkg in userAppNames.keys) {
+                for (pkg in managedAppNames.keys) {
                     try {
                         builder.addAllowedApplication(pkg)
                     } catch (_: Exception) {
                     }
                 }
-                routingModeDesc = if (foregroundOnlyMode) "النشط فقط: جاري الرصد" else "شامل لتطبيقات المستخدم"
+                routingModeDesc = if (foregroundOnlyMode) "النشط فقط: جاري الرصد" else "شامل للتطبيقات"
             } else {
                 var addedCount = 0
                 for (pkg in throttledPackages) {
@@ -368,13 +390,13 @@ class ThrottleVpnService : VpnService() {
                     }
                 }
                 if (addedCount == 0) {
-                    for (pkg in userAppNames.keys) {
+                    for (pkg in managedAppNames.keys) {
                         try {
                             builder.addAllowedApplication(pkg)
                         } catch (_: Exception) {
                         }
                     }
-                    routingModeDesc = "شامل لتطبيقات المستخدم"
+                    routingModeDesc = "شامل للتطبيقات"
                 } else {
                     routingModeDesc = "محدد ($addedCount تطبيق)"
                 }
