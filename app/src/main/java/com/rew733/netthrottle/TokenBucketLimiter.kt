@@ -4,50 +4,62 @@ class TokenBucketLimiter(initialBytesPerSecond: Long) {
 
     @Volatile
     private var bytesPerSecond: Long = initialBytesPerSecond.coerceAtLeast(1024L)
-    private var maxBurstBytes: Double = (bytesPerSecond * 0.25).coerceAtLeast(1500.0)
-    private var availableTokens: Double = maxBurstBytes
-    private var lastRefillTimestamp: Long = System.nanoTime()
-    private val lock = Any()
+
+    private var availableTokens: Double = 0.0
+    private var lastRefillNano: Long = System.nanoTime()
+    private val lock = Object()
 
     fun updateRate(newBytesPerSecond: Long) {
         synchronized(lock) {
             bytesPerSecond = newBytesPerSecond.coerceAtLeast(1024L)
-            maxBurstBytes = (bytesPerSecond * 0.25).coerceAtLeast(1500.0)
-            if (availableTokens > maxBurstBytes) {
-                availableTokens = maxBurstBytes
+            val maxBurst = bytesPerSecond * 0.2
+            if (availableTokens > maxBurst) {
+                availableTokens = maxBurst
             }
         }
     }
 
-    fun consume(bytesCount: Int) {
-        if (bytesCount <= 0) return
-        val totalWireBytes = bytesCount + 40 // يشمل ترويسة IP + TCP/UDP الفعلية
+    fun consume(bytes: Int) {
+        if (bytes <= 0) return
+        val totalCost = (bytes + 54).toDouble()
 
         while (true) {
             var sleepMillis = 0L
-            synchronized(lock) {
-                val now = System.nanoTime()
-                val elapsedSeconds = (now - lastRefillTimestamp) / 1_000_000_000.0
-                if (elapsedSeconds > 0) {
-                    availableTokens = (availableTokens + elapsedSeconds * bytesPerSecond)
-                        .coerceAtMost(maxBurstBytes)
-                    lastRefillTimestamp = now
-                }
+            var sleepNanos = 0
 
-                if (availableTokens >= totalWireBytes) {
-                    availableTokens -= totalWireBytes
+            synchronized(lock) {
+                refill()
+                if (availableTokens >= totalCost) {
+                    availableTokens -= totalCost
                     return
-                } else {
-                    val deficit = totalWireBytes - availableTokens
-                    sleepMillis = ((deficit / bytesPerSecond) * 1000.0).toLong().coerceAtLeast(1L)
                 }
+                val deficit = totalCost - availableTokens
+                val waitNanos = ((deficit / bytesPerSecond.toDouble()) * 1_000_000_000.0).toLong()
+                if (waitNanos <= 0L) {
+                    availableTokens = 0.0
+                    return
+                }
+                sleepMillis = waitNanos / 1_000_000L
+                sleepNanos = (waitNanos % 1_000_000L).toInt()
             }
+
             try {
-                Thread.sleep(sleepMillis)
+                Thread.sleep(sleepMillis, sleepNanos)
             } catch (_: InterruptedException) {
                 Thread.currentThread().interrupt()
                 return
             }
+        }
+    }
+
+    private fun refill() {
+        val now = System.nanoTime()
+        val elapsedNanos = now - lastRefillNano
+        if (elapsedNanos > 0L) {
+            val added = (elapsedNanos / 1_000_000_000.0) * bytesPerSecond.toDouble()
+            val maxBurst = bytesPerSecond * 0.2
+            availableTokens = (availableTokens + added).coerceAtMost(maxBurst)
+            lastRefillNano = now
         }
     }
 }
