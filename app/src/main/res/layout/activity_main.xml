@@ -89,6 +89,27 @@
             app:cornerRadius="10dp" />
     </LinearLayout>
 
+    <!-- خيار: التطبيق النشط على الشاشة فقط (حظر الخلفية وحماية النظام) -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:gravity="center_vertical"
+        android:background="#1B262C"
+        android:paddingHorizontal="12dp"
+        android:paddingVertical="6dp"
+        android:layout_marginBottom="8dp">
+
+        <com.google.android.material.switchmaterial.SwitchMaterial
+            android:id="@+id/switchForegroundOnly"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="التطبيق المفتوح فقط (حظر الخلفية مع حماية النظام)"
+            android:textColor="#E0F7FA"
+            android:textSize="13sp"
+            android:textStyle="bold" />
+    </LinearLayout>
+
     <!-- بطاقة الإحصائيات الحية والسجل التشخيصي -->
     <LinearLayout
         android:layout_width="match_parent"
