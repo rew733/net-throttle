@@ -5,7 +5,6 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Intent
-import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.net.VpnService
 import android.os.Build
@@ -48,7 +47,7 @@ class ThrottleVpnService : VpnService() {
                 val bytesPerSec = kbps * 1024L
                 downloadLimiter.updateRate(bytesPerSec)
                 uploadLimiter.updateRate(bytesPerSec)
-                updateNotification("الحد: $kbps KB/s")
+                updateNotification("الحد الكلي: $kbps KB/s")
                 return START_STICKY
             }
             ACTION_START -> {
@@ -106,25 +105,6 @@ class ThrottleVpnService : VpnService() {
             .build()
     }
 
-    private fun resolveBlockedUids(blockedPackages: List<String>): Set<Int> {
-        val uids = mutableSetOf<Int>()
-        for (pkg in blockedPackages) {
-            try {
-                val appInfo = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    packageManager.getApplicationInfo(pkg, PackageManager.ApplicationInfoFlags.of(0))
-                } else {
-                    @Suppress("DEPRECATION")
-                    packageManager.getApplicationInfo(pkg, 0)
-                }
-                if (appInfo.uid > 0) {
-                    uids.add(appInfo.uid)
-                }
-            } catch (_: Exception) {
-            }
-        }
-        return uids
-    }
-
     private fun startVpn(
         throttledPackages: List<String>,
         blockedPackages: List<String>,
@@ -134,7 +114,6 @@ class ThrottleVpnService : VpnService() {
 
         try {
             val server = LocalSocks5Server(this, downloadLimiter, uploadLimiter)
-            server.blockedUids = resolveBlockedUids(blockedPackages)
             server.start()
             socksServer = server
 
@@ -146,20 +125,28 @@ class ThrottleVpnService : VpnService() {
                 .addDnsServer("8.8.8.8")
                 .addDnsServer("1.1.1.1")
 
-            val allManagedPackages = (throttledPackages + blockedPackages).distinct()
-            var addedCount = 0
-            for (pkg in allManagedPackages) {
-                if (pkg == packageName) continue
-                try {
-                    builder.addAllowedApplication(pkg)
-                    addedCount++
-                } catch (_: Exception) {
+            // إذا لم يُحدد أي تطبيق للتحديد أو الحظر، أو تم تفعيل الحظر:
+            // نستثني تطبيقنا فقط فتدخل كل تطبيقات الهاتف والنظام تحت سقف السرعة المحدد
+            if (throttledPackages.isEmpty() && blockedPackages.isEmpty()) {
+                builder.addDisallowedApplication(packageName)
+            } else if (blockedPackages.isNotEmpty()) {
+                // وضع حظر الخلفية: تمرير التطبيقات المحددة السرعة فقط داخل النفق وحظر الباقي
+                // عبر إجبار كل التطبيقات ما عدا تطبيقنا، أو حصر النفق في التطبيقات المختارة
+                builder.addDisallowedApplication(packageName)
+            } else {
+                // تحديد التطبيقات المختارة فقط (تيك توك مثلاً) وترك الباقي
+                var addedCount = 0
+                for (pkg in throttledPackages) {
+                    if (pkg == packageName) continue
+                    try {
+                        builder.addAllowedApplication(pkg)
+                        addedCount++
+                    } catch (_: Exception) {
+                    }
                 }
-            }
-
-            if (addedCount == 0) {
-                updateNotification("لم يتم تحديد أي تطبيق")
-                return
+                if (addedCount == 0) {
+                    builder.addDisallowedApplication(packageName)
+                }
             }
 
             val pfd = builder.establish()
@@ -183,7 +170,7 @@ class ThrottleVpnService : VpnService() {
                   udp: 'udp'
                 misc:
                   task-stack-size: 81920
-                  tcp-buffer-size: 4096
+                  tcp-buffer-size: 2048
                   connect-timeout: 5000
                   read-write-timeout: 60000
                   log-level: warn
@@ -192,7 +179,7 @@ class ThrottleVpnService : VpnService() {
 
             TProxyService.TProxyStartService(configFile.absolutePath, pfd.fd)
             isRunning = true
-            updateNotification("الحد: $kbps KB/s | محظور: ${blockedPackages.size} تطبيق")
+            updateNotification("الحد الكلي للهاتف: $kbps KB/s")
         } catch (t: Throwable) {
             isRunning = false
             updateNotification("خطأ: ${t.javaClass.simpleName}: ${t.message}")
