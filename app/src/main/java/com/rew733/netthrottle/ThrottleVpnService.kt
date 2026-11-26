@@ -10,6 +10,7 @@ import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
 import androidx.core.app.NotificationCompat
+import hev.htproxy.TProxyService
 import java.io.File
 
 class ThrottleVpnService : VpnService() {
@@ -33,6 +34,7 @@ class ThrottleVpnService : VpnService() {
     private val downloadLimiter = TokenBucketLimiter(150 * 1024L)
     private val uploadLimiter = TokenBucketLimiter(150 * 1024L)
     private var socksServer: LocalSocks5Server? = null
+    private var tunnelThread: Thread? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
@@ -133,10 +135,11 @@ class ThrottleVpnService : VpnService() {
             return
         }
 
-        vpnInterface = builder.establish() ?: run {
+        val pfd = builder.establish() ?: run {
             stopVpn()
             return
         }
+        vpnInterface = pfd
 
         val configFile = File(cacheDir, "tproxy.conf")
         configFile.writeText(
@@ -153,7 +156,18 @@ class ThrottleVpnService : VpnService() {
         )
 
         isRunning = true
-        TProxyService.TProxyStartService(configFile.absolutePath, vpnInterface!!.fd)
+        val tunFd = pfd.fd
+        val configPath = configFile.absolutePath
+
+        tunnelThread = Thread {
+            try {
+                TProxyService.TProxyStartService(configPath, tunFd)
+            } catch (_: Exception) {
+            }
+        }.apply {
+            name = "HevSocks5TunnelThread"
+            start()
+        }
     }
 
     private fun stopVpnInternal() {
@@ -164,6 +178,7 @@ class ThrottleVpnService : VpnService() {
             }
         }
         isRunning = false
+        tunnelThread = null
         socksServer?.stop()
         socksServer = null
         try {
