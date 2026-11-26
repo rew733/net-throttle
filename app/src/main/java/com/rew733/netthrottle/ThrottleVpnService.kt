@@ -8,6 +8,8 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.net.VpnService
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.os.ParcelFileDescriptor
 import androidx.core.app.NotificationCompat
 import hev.htproxy.TProxyService
@@ -19,6 +21,7 @@ class ThrottleVpnService : VpnService() {
         const val ACTION_START = "com.rew733.netthrottle.START"
         const val ACTION_STOP = "com.rew733.netthrottle.STOP"
         const val ACTION_UPDATE_SPEED = "com.rew733.netthrottle.UPDATE_SPEED"
+        const val ACTION_REFRESH = "com.rew733.netthrottle.REFRESH"
         const val EXTRA_PACKAGES = "extra_packages"
         const val EXTRA_BLOCKED_PACKAGES = "extra_blocked_packages"
         const val EXTRA_SPEED_KBPS = "extra_speed_kbps"
@@ -29,12 +32,24 @@ class ThrottleVpnService : VpnService() {
 
         private const val CHANNEL_ID = "net_throttle_vpn"
         private const val NOTIF_ID = 101
+        private const val AUTO_REFRESH_INTERVAL_MS = 5 * 60 * 1000L // 5 دقائق
     }
 
     private var vpnInterface: ParcelFileDescriptor? = null
     private val downloadLimiter = TokenBucketLimiter(100 * 1024L)
     private val uploadLimiter = TokenBucketLimiter(100 * 1024L)
     private var socksServer: LocalSocks5Server? = null
+    private var currentKbps: Int = 100
+
+    private val handler = Handler(Looper.getMainLooper())
+    private val autoRefreshRunnable = object : Runnable {
+        override fun run() {
+            if (isRunning) {
+                performInternalRefresh("تحديث تلقائي")
+                handler.postDelayed(this, AUTO_REFRESH_INTERVAL_MS)
+            }
+        }
+    }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
@@ -43,25 +58,44 @@ class ThrottleVpnService : VpnService() {
                 return START_NOT_STICKY
             }
             ACTION_UPDATE_SPEED -> {
-                val kbps = intent.getIntExtra(EXTRA_SPEED_KBPS, 100)
-                val bytesPerSec = kbps * 1024L
+                currentKbps = intent.getIntExtra(EXTRA_SPEED_KBPS, 100).coerceAtLeast(1)
+                val bytesPerSec = currentKbps * 1024L
                 downloadLimiter.updateRate(bytesPerSec)
                 uploadLimiter.updateRate(bytesPerSec)
-                updateNotification("الحد الكلي: $kbps KB/s")
+                updateNotification("الحد الكلي: $currentKbps KB/s")
+                return START_STICKY
+            }
+            ACTION_REFRESH -> {
+                if (isRunning) {
+                    performInternalRefresh("تم التحديث يدوياً")
+                    handler.removeCallbacks(autoRefreshRunnable)
+                    handler.postDelayed(autoRefreshRunnable, AUTO_REFRESH_INTERVAL_MS)
+                }
                 return START_STICKY
             }
             ACTION_START -> {
                 val throttled = intent.getStringArrayListExtra(EXTRA_PACKAGES) ?: arrayListOf()
                 val blocked = intent.getStringArrayListExtra(EXTRA_BLOCKED_PACKAGES) ?: arrayListOf()
-                val kbps = intent.getIntExtra(EXTRA_SPEED_KBPS, 100)
-                val bytesPerSec = kbps * 1024L
+                currentKbps = intent.getIntExtra(EXTRA_SPEED_KBPS, 100).coerceAtLeast(1)
+                val bytesPerSec = currentKbps * 1024L
                 downloadLimiter.updateRate(bytesPerSec)
                 uploadLimiter.updateRate(bytesPerSec)
                 startForegroundServiceWithNotification("جاري التشغيل...")
-                startVpn(throttled, blocked, kbps)
+                startVpn(throttled, blocked, currentKbps)
             }
         }
         return START_STICKY
+    }
+
+    private fun performInternalRefresh(reason: String) {
+        try {
+            socksServer?.refresh()
+            val bytesPerSec = currentKbps * 1024L
+            downloadLimiter.updateRate(bytesPerSec)
+            uploadLimiter.updateRate(bytesPerSec)
+            updateNotification("الحد: $currentKbps KB/s ($reason)")
+        } catch (_: Throwable) {
+        }
     }
 
     private fun startForegroundServiceWithNotification(text: String) {
@@ -98,7 +132,7 @@ class ThrottleVpnService : VpnService() {
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("NetThrottle نشط")
             .setContentText(text)
-            .setSmallIcon(android.R.drawable.stat_sys_download)
+            .setSmallIcon(android.R.drawable.ic_lock_idle_lock)
             .setContentIntent(openIntent)
             .addAction(android.R.drawable.ic_media_pause, "إيقاف", stopIntent)
             .setOngoing(true)
@@ -125,16 +159,11 @@ class ThrottleVpnService : VpnService() {
                 .addDnsServer("8.8.8.8")
                 .addDnsServer("1.1.1.1")
 
-            // إذا لم يُحدد أي تطبيق للتحديد أو الحظر، أو تم تفعيل الحظر:
-            // نستثني تطبيقنا فقط فتدخل كل تطبيقات الهاتف والنظام تحت سقف السرعة المحدد
             if (throttledPackages.isEmpty() && blockedPackages.isEmpty()) {
                 builder.addDisallowedApplication(packageName)
             } else if (blockedPackages.isNotEmpty()) {
-                // وضع حظر الخلفية: تمرير التطبيقات المحددة السرعة فقط داخل النفق وحظر الباقي
-                // عبر إجبار كل التطبيقات ما عدا تطبيقنا، أو حصر النفق في التطبيقات المختارة
                 builder.addDisallowedApplication(packageName)
             } else {
-                // تحديد التطبيقات المختارة فقط (تيك توك مثلاً) وترك الباقي
                 var addedCount = 0
                 for (pkg in throttledPackages) {
                     if (pkg == packageName) continue
@@ -180,6 +209,9 @@ class ThrottleVpnService : VpnService() {
             TProxyService.TProxyStartService(configFile.absolutePath, pfd.fd)
             isRunning = true
             updateNotification("الحد الكلي للهاتف: $kbps KB/s")
+
+            handler.removeCallbacks(autoRefreshRunnable)
+            handler.postDelayed(autoRefreshRunnable, AUTO_REFRESH_INTERVAL_MS)
         } catch (t: Throwable) {
             isRunning = false
             updateNotification("خطأ: ${t.javaClass.simpleName}: ${t.message}")
@@ -187,6 +219,7 @@ class ThrottleVpnService : VpnService() {
     }
 
     private fun stopVpnInternal() {
+        handler.removeCallbacks(autoRefreshRunnable)
         if (isRunning) {
             try {
                 TProxyService.TProxyStopService()
