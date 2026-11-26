@@ -4,13 +4,19 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.app.usage.UsageEvents
+import android.app.usage.UsageStatsManager
+import android.content.Context
 import android.content.Intent
+import android.content.pm.ApplicationInfo
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.net.VpnService
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.ParcelFileDescriptor
+import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 import hev.htproxy.TProxyService
 import java.io.File
@@ -25,6 +31,7 @@ class ThrottleVpnService : VpnService() {
         const val EXTRA_PACKAGES = "extra_packages"
         const val EXTRA_BLOCKED_PACKAGES = "extra_blocked_packages"
         const val EXTRA_SPEED_KBPS = "extra_speed_kbps"
+        const val EXTRA_FOREGROUND_ONLY_MODE = "extra_foreground_only_mode"
 
         @Volatile
         var isRunning = false
@@ -59,6 +66,12 @@ class ThrottleVpnService : VpnService() {
     private var currentKbps: Int = 100
     private var routingModeDesc: String = ""
 
+    private var foregroundOnlyMode: Boolean = false
+    private var userInstalledPackages: Set<String> = emptySet()
+    private var lastActiveUserApp: String? = null
+    private var cachedThrottled: List<String> = emptyList()
+    private var cachedBlocked: List<String> = emptyList()
+
     private var lastDownBytes = 0L
     private var lastUpBytes = 0L
 
@@ -67,6 +80,9 @@ class ThrottleVpnService : VpnService() {
     private val statsRunnable = object : Runnable {
         override fun run() {
             if (isRunning) {
+                if (foregroundOnlyMode) {
+                    checkForegroundAppSwitch()
+                }
                 val server = socksServer
                 if (server != null) {
                     val curDown = server.totalDownloadBytes.get()
@@ -123,15 +139,62 @@ class ThrottleVpnService : VpnService() {
                 return START_STICKY
             }
             ACTION_START -> {
-                val throttled = intent.getStringArrayListExtra(EXTRA_PACKAGES) ?: arrayListOf()
-                val blocked = intent.getStringArrayListExtra(EXTRA_BLOCKED_PACKAGES) ?: arrayListOf()
+                cachedThrottled = intent.getStringArrayListExtra(EXTRA_PACKAGES) ?: arrayListOf()
+                cachedBlocked = intent.getStringArrayListExtra(EXTRA_BLOCKED_PACKAGES) ?: arrayListOf()
+                foregroundOnlyMode = intent.getBooleanExtra(EXTRA_FOREGROUND_ONLY_MODE, false)
                 currentKbps = intent.getIntExtra(EXTRA_SPEED_KBPS, 100).coerceAtLeast(1)
                 applySpeedLimits(currentKbps)
+                userInstalledPackages = collectUserPackages()
+                lastActiveUserApp = null
                 startForegroundServiceWithNotification("جاري التشغيل...")
-                startVpn(throttled, blocked, currentKbps)
+                startVpn(cachedThrottled, cachedBlocked, currentKbps)
             }
         }
         return START_STICKY
+    }
+
+    private fun collectUserPackages(): Set<String> {
+        val pm = packageManager
+        val list = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            pm.getInstalledApplications(PackageManager.ApplicationInfoFlags.of(0))
+        } else {
+            @Suppress("DEPRECATION")
+            pm.getInstalledApplications(0)
+        }
+        return list.filter { info ->
+            info.packageName != packageName &&
+                    (info.flags and ApplicationInfo.FLAG_SYSTEM) == 0 &&
+                    pm.getLaunchIntentForPackage(info.packageName) != null
+        }.map { it.packageName }.toSet()
+    }
+
+    private fun detectForegroundUserPackage(): String? {
+        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+        if (!pm.isInteractive) return null
+
+        val usm = getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
+        val now = System.currentTimeMillis()
+        val events = usm.queryEvents(now - 10_000L, now)
+        val event = UsageEvents.Event()
+        var latestPkg: String? = null
+        while (events.hasNextEvent()) {
+            events.getNextEvent(event)
+            if (event.eventType == UsageEvents.Event.ACTIVITY_RESUMED) {
+                latestPkg = event.packageName
+            }
+        }
+        if (latestPkg == null) return lastActiveUserApp
+        if (latestPkg == packageName) return null
+        return if (userInstalledPackages.contains(latestPkg)) latestPkg else null
+    }
+
+    private fun checkForegroundAppSwitch() {
+        val activePkg = detectForegroundUserPackage()
+        if (activePkg != lastActiveUserApp) {
+            lastActiveUserApp = activePkg
+            socksServer?.refresh()
+            startVpn(cachedThrottled, cachedBlocked, currentKbps)
+        }
     }
 
     private fun performInternalRefresh(reason: String) {
@@ -208,12 +271,39 @@ class ThrottleVpnService : VpnService() {
                 .addDnsServer("8.8.8.8")
                 .addDnsServer("1.1.1.1")
 
-            if (throttledPackages.isEmpty() && blockedPackages.isEmpty()) {
-                builder.addDisallowedApplication(packageName)
-                routingModeDesc = "شامل للهاتف"
-            } else if (blockedPackages.isNotEmpty()) {
-                builder.addDisallowedApplication(packageName)
-                routingModeDesc = "شامل + حظر (${blockedPackages.size})"
+            var activeTunnelEnabled = true
+
+            if (foregroundOnlyMode) {
+                // وضع التطبيق النشط فقط: تطبيقات النظام مستثناة تلقائياً،
+                // والمفتوح على الشاشة فقط يعمل بالسرعة المحددة بينما البقية محظورة
+                val currentApp = lastActiveUserApp
+                if (currentApp != null) {
+                    try {
+                        builder.addAllowedApplication(currentApp)
+                        routingModeDesc = "النشط فقط: $currentApp"
+                    } catch (_: Exception) {
+                        activeTunnelEnabled = false
+                        routingModeDesc = "النشط فقط: وضع السكون"
+                    }
+                } else {
+                    // كل تطبيقات المستخدم تدخل النفق بدون تشغيل الخادم (حظر كامل للخلفية مع حماية النظام)
+                    for (pkg in userInstalledPackages) {
+                        try {
+                            builder.addAllowedApplication(pkg)
+                        } catch (_: Exception) {
+                        }
+                    }
+                    activeTunnelEnabled = false
+                    routingModeDesc = "النشط فقط: الخلفية محظورة"
+                }
+            } else if (throttledPackages.isEmpty() && blockedPackages.isEmpty()) {
+                for (pkg in userInstalledPackages) {
+                    try {
+                        builder.addAllowedApplication(pkg)
+                    } catch (_: Exception) {
+                    }
+                }
+                routingModeDesc = "شامل لتطبيقات المستخدم"
             } else {
                 var addedCount = 0
                 for (pkg in throttledPackages) {
@@ -225,8 +315,13 @@ class ThrottleVpnService : VpnService() {
                     }
                 }
                 if (addedCount == 0) {
-                    builder.addDisallowedApplication(packageName)
-                    routingModeDesc = "شامل للهاتف"
+                    for (pkg in userInstalledPackages) {
+                        try {
+                            builder.addAllowedApplication(pkg)
+                        } catch (_: Exception) {
+                        }
+                    }
+                    routingModeDesc = "شامل لتطبيقات المستخدم"
                 } else {
                     routingModeDesc = "محدد ($addedCount تطبيق)"
                 }
@@ -240,31 +335,37 @@ class ThrottleVpnService : VpnService() {
             }
             vpnInterface = pfd
 
-            val configFile = File(cacheDir, "tproxy.conf")
-            configFile.writeText(
-                """
-                tunnel:
-                  name: tun0
-                  mtu: 1500
-                  multi-queue: false
-                  ipv4: 10.0.0.2
-                socks5:
-                  port: ${server.port}
-                  address: 127.0.0.1
-                  udp: 'udp'
-                misc:
-                  task-stack-size: 81920
-                  tcp-buffer-size: 2048
-                  connect-timeout: 5000
-                  read-write-timeout: 60000
-                  log-level: warn
-                """.trimIndent()
-            )
+            if (activeTunnelEnabled) {
+                val configFile = File(cacheDir, "tproxy.conf")
+                configFile.writeText(
+                    """
+                    tunnel:
+                      name: tun0
+                      mtu: 1500
+                      multi-queue: false
+                      ipv4: 10.0.0.2
+                    socks5:
+                      port: ${server.port}
+                      address: 127.0.0.1
+                      udp: 'udp'
+                    misc:
+                      task-stack-size: 81920
+                      tcp-buffer-size: 2048
+                      connect-timeout: 5000
+                      read-write-timeout: 60000
+                      log-level: warn
+                    """.trimIndent()
+                )
+                TProxyService.TProxyStartService(configFile.absolutePath, pfd.fd)
+            } else {
+                // إيقاف خادم التمرير ليتم إسقاط حزم تطبيقات الخلفية فوراً دون استهلاك أي بايت
+                server.stop()
+                socksServer = null
+            }
 
-            TProxyService.TProxyStartService(configFile.absolutePath, pfd.fd)
             isRunning = true
-            diagnosticStatus = "نشط ($routingModeDesc) | الحد: $kbps KB/s (TCP 65% + UDP 35%)"
-            updateNotification("الحد: $kbps KB/s")
+            diagnosticStatus = "نشط ($routingModeDesc) | الحد: $kbps KB/s"
+            updateNotification("الحد: $kbps KB/s ($routingModeDesc)")
 
             handler.removeCallbacks(statsRunnable)
             handler.postDelayed(statsRunnable, 1000L)
