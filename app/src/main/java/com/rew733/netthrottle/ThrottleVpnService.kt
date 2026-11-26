@@ -55,7 +55,7 @@ class ThrottleVpnService : VpnService() {
 
         private const val CHANNEL_ID = "net_throttle_vpn"
         private const val NOTIF_ID = 101
-        private const val AUTO_REFRESH_INTERVAL_MS = 5 * 60 * 1000L
+        private const val AUTO_REFRESH_INTERVAL_MS = 15 * 60 * 1000L
     }
 
     private var vpnInterface: ParcelFileDescriptor? = null
@@ -67,8 +67,9 @@ class ThrottleVpnService : VpnService() {
     private var routingModeDesc: String = ""
 
     private var foregroundOnlyMode: Boolean = false
-    private var userAppUids: Map<String, Int> = emptyMap()
-    private var lastActivePkg: String? = null
+    private var userPackages: Set<String> = emptySet()
+    private var lastDetectedActivePkg: String? = null
+    private var currentTunnelTargetPkg: String? = "__NONE__"
 
     private var lastDownBytes = 0L
     private var lastUpBytes = 0L
@@ -81,7 +82,7 @@ class ThrottleVpnService : VpnService() {
                 val server = socksServer
                 if (server != null) {
                     if (foregroundOnlyMode) {
-                        updateActiveForegroundApp(server)
+                        monitorAndRouteActiveApp(server)
                     }
                     val curDown = server.totalDownloadBytes.get()
                     val curUp = server.totalUploadBytes.get()
@@ -143,8 +144,9 @@ class ThrottleVpnService : VpnService() {
                 foregroundOnlyMode = intent.getBooleanExtra(EXTRA_FOREGROUND_ONLY_MODE, false)
                 currentKbps = intent.getIntExtra(EXTRA_SPEED_KBPS, 100).coerceAtLeast(1)
                 applySpeedLimits(currentKbps)
-                userAppUids = collectUserPackagesWithUids()
-                lastActivePkg = null
+                userPackages = collectUserPackages()
+                lastDetectedActivePkg = null
+                currentTunnelTargetPkg = "__NONE__"
                 startForegroundServiceWithNotification("جاري التشغيل...")
                 startVpn(throttled, blocked, currentKbps)
             }
@@ -152,7 +154,7 @@ class ThrottleVpnService : VpnService() {
         return START_STICKY
     }
 
-    private fun collectUserPackagesWithUids(): Map<String, Int> {
+    private fun collectUserPackages(): Set<String> {
         val pm = packageManager
         val list = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             pm.getInstalledApplications(PackageManager.ApplicationInfoFlags.of(0))
@@ -160,16 +162,11 @@ class ThrottleVpnService : VpnService() {
             @Suppress("DEPRECATION")
             pm.getInstalledApplications(0)
         }
-        val map = mutableMapOf<String, Int>()
-        for (info in list) {
-            if (info.packageName != packageName &&
-                (info.flags and ApplicationInfo.FLAG_SYSTEM) == 0 &&
-                pm.getLaunchIntentForPackage(info.packageName) != null
-            ) {
-                map[info.packageName] = info.uid
-            }
-        }
-        return map
+        return list.filter { info ->
+            info.packageName != packageName &&
+                    (info.flags and ApplicationInfo.FLAG_SYSTEM) == 0 &&
+                    pm.getLaunchIntentForPackage(info.packageName) != null
+        }.map { it.packageName }.toSet()
     }
 
     private fun detectForegroundUserPackage(): String? {
@@ -178,9 +175,8 @@ class ThrottleVpnService : VpnService() {
 
         val usm = getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
         val now = System.currentTimeMillis()
-
-        // 1. فحص الأحداث الحديثة في آخر 30 ثانية
-        val events = usm.queryEvents(now - 30_000L, now)
+        // فحص أحداث الانتقال للواجهة خلال آخر دقيقتين
+        val events = usm.queryEvents(now - 120_000L, now)
         val event = UsageEvents.Event()
         var latestEventPkg: String? = null
         while (events.hasNextEvent()) {
@@ -189,35 +185,104 @@ class ThrottleVpnService : VpnService() {
                 latestEventPkg = event.packageName
             }
         }
-        if (latestEventPkg != null) {
-            return if (userAppUids.containsKey(latestEventPkg)) latestEventPkg else null
-        }
 
-        // 2. إذا لم يكن هناك حدث انتقال حديث (المستخدم ما زال داخل نفس التطبيق)،
-        // نتحقق من آخر تطبيق مستخدم في إحصائيات اليوم
-        val stats = usm.queryUsageStats(UsageStatsManager.INTERVAL_DAILY, now - 3600_000L, now)
-        val recentStat = stats?.maxByOrNull { it.lastTimeUsed }
-        val recentPkg = recentStat?.packageName
-        if (recentPkg != null && userAppUids.containsKey(recentPkg)) {
-            return recentPkg
-        }
-        return lastActivePkg
+        val candidate = latestEventPkg ?: lastDetectedActivePkg ?: return null
+        lastDetectedActivePkg = candidate
+
+        // إذا كان التطبيق المفتوح هو NetThrottle نفسه أو مشغل الشاشة، نوقف تمرير البيانات
+        if (candidate == packageName) return null
+        return if (userPackages.contains(candidate)) candidate else null
     }
 
-    private fun updateActiveForegroundApp(server: LocalSocks5Server) {
+    private fun monitorAndRouteActiveApp(server: LocalSocks5Server) {
         val activePkg = detectForegroundUserPackage()
-        if (activePkg != lastActivePkg) {
-            lastActivePkg = activePkg
-            // تفريغ المقابس القديمة فوراً عند الانتقال من تطبيق لآخر
-            server.refresh()
-        }
-        val uid = if (activePkg != null) userAppUids[activePkg] ?: -1 else -1
         server.foregroundOnlyEnabled = true
-        server.allowedForegroundUid = uid
+        server.hasActiveForegroundApp = (activePkg != null)
+
+        if (activePkg != currentTunnelTargetPkg) {
+            currentTunnelTargetPkg = activePkg
+            server.refresh()
+            rebuildVpnInterfaceForTarget(activePkg)
+        }
+
         routingModeDesc = if (activePkg != null) {
             "النشط: ${activePkg.substringAfterLast('.')}"
         } else {
             "النشط فقط: الخلفية محظورة"
+        }
+    }
+
+    private fun rebuildVpnInterfaceForTarget(targetPkg: String?) {
+        try {
+            val builder = Builder()
+                .setSession("NetThrottle")
+                .setMtu(1500)
+                .addAddress("10.0.0.2", 32)
+                .addRoute("0.0.0.0", 0)
+                .addDnsServer("8.8.8.8")
+                .addDnsServer("1.1.1.1")
+
+            if (targetPkg != null) {
+                // عزل التطبيق المفتوح فقط داخل النفق، بينما تُحظر بقية تطبيقات المستخدم
+                // وتُستثنى تطبيقات النظام بالكامل
+                for (pkg in userPackages) {
+                    if (pkg != targetPkg) {
+                        // تطبيقات الخلفية: لا نضيفها للنفق إذا أردنا حظرها عبر نفق ثانٍ،
+                        // لكن أندرويد يسمح بنفق واحد فقط؛ لذلك ندخل كل تطبيقات المستخدم
+                        // ونسمح للتطبيق المفتوح فقط بالمرور في الخادم
+                    }
+                }
+                for (pkg in userPackages) {
+                    try {
+                        builder.addAllowedApplication(pkg)
+                    } catch (_: Exception) {
+                    }
+                }
+            } else {
+                for (pkg in userPackages) {
+                    try {
+                        builder.addAllowedApplication(pkg)
+                    } catch (_: Exception) {
+                    }
+                }
+            }
+
+            val newPfd = builder.establish() ?: return
+            val oldPfd = vpnInterface
+            vpnInterface = newPfd
+
+            try {
+                TProxyService.TProxyStopService()
+            } catch (_: Throwable) {
+            }
+            try {
+                oldPfd?.close()
+            } catch (_: Throwable) {
+            }
+
+            val server = socksServer ?: return
+            val configFile = File(cacheDir, "tproxy.conf")
+            configFile.writeText(
+                """
+                tunnel:
+                  name: tun0
+                  mtu: 1500
+                  multi-queue: false
+                  ipv4: 10.0.0.2
+                socks5:
+                  port: ${server.port}
+                  address: 127.0.0.1
+                  udp: 'udp'
+                misc:
+                  task-stack-size: 81920
+                  tcp-buffer-size: 2048
+                  connect-timeout: 5000
+                  read-write-timeout: 60000
+                  log-level: warn
+                """.trimIndent()
+            )
+            TProxyService.TProxyStartService(configFile.absolutePath, newPfd.fd)
+        } catch (_: Throwable) {
         }
     }
 
@@ -283,6 +348,7 @@ class ThrottleVpnService : VpnService() {
         try {
             val server = LocalSocks5Server(this, downloadLimiter, uploadLimiter, udpLimiter)
             server.foregroundOnlyEnabled = foregroundOnlyMode
+            server.hasActiveForegroundApp = false
             server.start()
             socksServer = server
             lastDownBytes = 0L
@@ -296,23 +362,14 @@ class ThrottleVpnService : VpnService() {
                 .addDnsServer("8.8.8.8")
                 .addDnsServer("1.1.1.1")
 
-            if (foregroundOnlyMode) {
-                // إدخال تطبيقات المستخدم فقط (تطبيقات النظام مستثناة ومحمية بالكامل)
-                for (pkg in userAppUids.keys) {
+            if (foregroundOnlyMode || (throttledPackages.isEmpty() && blockedPackages.isEmpty())) {
+                for (pkg in userPackages) {
                     try {
                         builder.addAllowedApplication(pkg)
                     } catch (_: Exception) {
                     }
                 }
-                routingModeDesc = "النشط فقط: جاري الرصد"
-            } else if (throttledPackages.isEmpty() && blockedPackages.isEmpty()) {
-                for (pkg in userAppUids.keys) {
-                    try {
-                        builder.addAllowedApplication(pkg)
-                    } catch (_: Exception) {
-                    }
-                }
-                routingModeDesc = "شامل لتطبيقات المستخدم"
+                routingModeDesc = if (foregroundOnlyMode) "النشط فقط: جاري الرصد" else "شامل لتطبيقات المستخدم"
             } else {
                 var addedCount = 0
                 for (pkg in throttledPackages) {
@@ -324,7 +381,7 @@ class ThrottleVpnService : VpnService() {
                     }
                 }
                 if (addedCount == 0) {
-                    for (pkg in userAppUids.keys) {
+                    for (pkg in userPackages) {
                         try {
                             builder.addAllowedApplication(pkg)
                         } catch (_: Exception) {
@@ -371,7 +428,7 @@ class ThrottleVpnService : VpnService() {
             updateNotification("الحد: $kbps KB/s")
 
             handler.removeCallbacks(statsRunnable)
-            handler.postDelayed(statsRunnable, 1000L)
+            handler.postDelayed(statsRunnable, 500L)
 
             handler.removeCallbacks(autoRefreshRunnable)
             handler.postDelayed(autoRefreshRunnable, AUTO_REFRESH_INTERVAL_MS)
