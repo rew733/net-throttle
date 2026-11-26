@@ -52,8 +52,9 @@ class ThrottleVpnService : VpnService() {
     }
 
     private var vpnInterface: ParcelFileDescriptor? = null
-    private val downloadLimiter = TokenBucketLimiter(100 * 1024L)
-    private val uploadLimiter = TokenBucketLimiter(100 * 1024L)
+    private val downloadLimiter = TokenBucketLimiter(65 * 1024L)
+    private val uploadLimiter = TokenBucketLimiter(65 * 1024L)
+    private val udpLimiter = TokenBucketLimiter(35 * 1024L)
     private var socksServer: LocalSocks5Server? = null
     private var currentKbps: Int = 100
     private var routingModeDesc: String = ""
@@ -92,6 +93,15 @@ class ThrottleVpnService : VpnService() {
         }
     }
 
+    private fun applySpeedLimits(kbps: Int) {
+        val totalBytes = kbps * 1024L
+        val tcpBytes = (totalBytes * 0.65).toLong().coerceAtLeast(1024L)
+        val udpBytes = (totalBytes * 0.35).toLong().coerceAtLeast(1024L)
+        downloadLimiter.updateRate(tcpBytes)
+        uploadLimiter.updateRate(tcpBytes)
+        udpLimiter.updateRate(udpBytes)
+    }
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_STOP -> {
@@ -100,9 +110,7 @@ class ThrottleVpnService : VpnService() {
             }
             ACTION_UPDATE_SPEED -> {
                 currentKbps = intent.getIntExtra(EXTRA_SPEED_KBPS, 100).coerceAtLeast(1)
-                val bytesPerSec = currentKbps * 1024L
-                downloadLimiter.updateRate(bytesPerSec)
-                uploadLimiter.updateRate(bytesPerSec)
+                applySpeedLimits(currentKbps)
                 updateNotification("الحد الكلي: $currentKbps KB/s")
                 return START_STICKY
             }
@@ -118,9 +126,7 @@ class ThrottleVpnService : VpnService() {
                 val throttled = intent.getStringArrayListExtra(EXTRA_PACKAGES) ?: arrayListOf()
                 val blocked = intent.getStringArrayListExtra(EXTRA_BLOCKED_PACKAGES) ?: arrayListOf()
                 currentKbps = intent.getIntExtra(EXTRA_SPEED_KBPS, 100).coerceAtLeast(1)
-                val bytesPerSec = currentKbps * 1024L
-                downloadLimiter.updateRate(bytesPerSec)
-                uploadLimiter.updateRate(bytesPerSec)
+                applySpeedLimits(currentKbps)
                 startForegroundServiceWithNotification("جاري التشغيل...")
                 startVpn(throttled, blocked, currentKbps)
             }
@@ -131,9 +137,7 @@ class ThrottleVpnService : VpnService() {
     private fun performInternalRefresh(reason: String) {
         try {
             socksServer?.refresh()
-            val bytesPerSec = currentKbps * 1024L
-            downloadLimiter.updateRate(bytesPerSec)
-            uploadLimiter.updateRate(bytesPerSec)
+            applySpeedLimits(currentKbps)
             updateNotification("الحد: $currentKbps KB/s ($reason)")
             diagnosticStatus = "$reason | الحد: $currentKbps KB/s | تم تصفير المقابس"
         } catch (t: Throwable) {
@@ -190,7 +194,7 @@ class ThrottleVpnService : VpnService() {
         stopVpnInternal()
 
         try {
-            val server = LocalSocks5Server(this, downloadLimiter, uploadLimiter)
+            val server = LocalSocks5Server(this, downloadLimiter, uploadLimiter, udpLimiter)
             server.start()
             socksServer = server
             lastDownBytes = 0L
@@ -259,7 +263,7 @@ class ThrottleVpnService : VpnService() {
 
             TProxyService.TProxyStartService(configFile.absolutePath, pfd.fd)
             isRunning = true
-            diagnosticStatus = "نشط ($routingModeDesc) | الحد: $kbps KB/s"
+            diagnosticStatus = "نشط ($routingModeDesc) | الحد: $kbps KB/s (TCP 65% + UDP 35%)"
             updateNotification("الحد: $kbps KB/s")
 
             handler.removeCallbacks(statsRunnable)
