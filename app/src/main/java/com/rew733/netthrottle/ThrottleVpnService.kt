@@ -67,10 +67,8 @@ class ThrottleVpnService : VpnService() {
     private var routingModeDesc: String = ""
 
     private var foregroundOnlyMode: Boolean = false
-    private var userInstalledPackages: Set<String> = emptySet()
-    private var lastActiveUserApp: String? = null
-    private var cachedThrottled: List<String> = emptyList()
-    private var cachedBlocked: List<String> = emptyList()
+    private var userAppUids: Map<String, Int> = emptyMap()
+    private var lastActivePkg: String? = null
 
     private var lastDownBytes = 0L
     private var lastUpBytes = 0L
@@ -80,11 +78,11 @@ class ThrottleVpnService : VpnService() {
     private val statsRunnable = object : Runnable {
         override fun run() {
             if (isRunning) {
-                if (foregroundOnlyMode) {
-                    checkForegroundAppSwitch()
-                }
                 val server = socksServer
                 if (server != null) {
+                    if (foregroundOnlyMode) {
+                        updateActiveForegroundApp(server)
+                    }
                     val curDown = server.totalDownloadBytes.get()
                     val curUp = server.totalUploadBytes.get()
                     liveDownKbps = ((curDown - lastDownBytes) / 1024L).toInt().coerceAtLeast(0)
@@ -92,8 +90,9 @@ class ThrottleVpnService : VpnService() {
                     lastDownBytes = curDown
                     lastUpBytes = curUp
                     liveConnections = server.activeConnections.get()
+                    val blocked = server.blockedCount.get()
                     val errs = server.errorCount.get()
-                    diagnosticStatus = "نشط ($routingModeDesc) | الحد: $currentKbps KB/s | أخطاء: $errs (${server.lastError})"
+                    diagnosticStatus = "نشط ($routingModeDesc) | الحد: $currentKbps KB/s | محظور: $blocked | أخطاء: $errs"
                 }
                 handler.postDelayed(this, 1000L)
             }
@@ -139,21 +138,21 @@ class ThrottleVpnService : VpnService() {
                 return START_STICKY
             }
             ACTION_START -> {
-                cachedThrottled = intent.getStringArrayListExtra(EXTRA_PACKAGES) ?: arrayListOf()
-                cachedBlocked = intent.getStringArrayListExtra(EXTRA_BLOCKED_PACKAGES) ?: arrayListOf()
+                val throttled = intent.getStringArrayListExtra(EXTRA_PACKAGES) ?: arrayListOf()
+                val blocked = intent.getStringArrayListExtra(EXTRA_BLOCKED_PACKAGES) ?: arrayListOf()
                 foregroundOnlyMode = intent.getBooleanExtra(EXTRA_FOREGROUND_ONLY_MODE, false)
                 currentKbps = intent.getIntExtra(EXTRA_SPEED_KBPS, 100).coerceAtLeast(1)
                 applySpeedLimits(currentKbps)
-                userInstalledPackages = collectUserPackages()
-                lastActiveUserApp = null
+                userAppUids = collectUserPackagesWithUids()
+                lastActivePkg = null
                 startForegroundServiceWithNotification("جاري التشغيل...")
-                startVpn(cachedThrottled, cachedBlocked, currentKbps)
+                startVpn(throttled, blocked, currentKbps)
             }
         }
         return START_STICKY
     }
 
-    private fun collectUserPackages(): Set<String> {
+    private fun collectUserPackagesWithUids(): Map<String, Int> {
         val pm = packageManager
         val list = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             pm.getInstalledApplications(PackageManager.ApplicationInfoFlags.of(0))
@@ -161,11 +160,16 @@ class ThrottleVpnService : VpnService() {
             @Suppress("DEPRECATION")
             pm.getInstalledApplications(0)
         }
-        return list.filter { info ->
-            info.packageName != packageName &&
-                    (info.flags and ApplicationInfo.FLAG_SYSTEM) == 0 &&
-                    pm.getLaunchIntentForPackage(info.packageName) != null
-        }.map { it.packageName }.toSet()
+        val map = mutableMapOf<String, Int>()
+        for (info in list) {
+            if (info.packageName != packageName &&
+                (info.flags and ApplicationInfo.FLAG_SYSTEM) == 0 &&
+                pm.getLaunchIntentForPackage(info.packageName) != null
+            ) {
+                map[info.packageName] = info.uid
+            }
+        }
+        return map
     }
 
     private fun detectForegroundUserPackage(): String? {
@@ -174,26 +178,46 @@ class ThrottleVpnService : VpnService() {
 
         val usm = getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
         val now = System.currentTimeMillis()
-        val events = usm.queryEvents(now - 10_000L, now)
+
+        // 1. فحص الأحداث الحديثة في آخر 30 ثانية
+        val events = usm.queryEvents(now - 30_000L, now)
         val event = UsageEvents.Event()
-        var latestPkg: String? = null
+        var latestEventPkg: String? = null
         while (events.hasNextEvent()) {
             events.getNextEvent(event)
             if (event.eventType == UsageEvents.Event.ACTIVITY_RESUMED) {
-                latestPkg = event.packageName
+                latestEventPkg = event.packageName
             }
         }
-        if (latestPkg == null) return lastActiveUserApp
-        if (latestPkg == packageName) return null
-        return if (userInstalledPackages.contains(latestPkg)) latestPkg else null
+        if (latestEventPkg != null) {
+            return if (userAppUids.containsKey(latestEventPkg)) latestEventPkg else null
+        }
+
+        // 2. إذا لم يكن هناك حدث انتقال حديث (المستخدم ما زال داخل نفس التطبيق)،
+        // نتحقق من آخر تطبيق مستخدم في إحصائيات اليوم
+        val stats = usm.queryUsageStats(UsageStatsManager.INTERVAL_DAILY, now - 3600_000L, now)
+        val recentStat = stats?.maxByOrNull { it.lastTimeUsed }
+        val recentPkg = recentStat?.packageName
+        if (recentPkg != null && userAppUids.containsKey(recentPkg)) {
+            return recentPkg
+        }
+        return lastActivePkg
     }
 
-    private fun checkForegroundAppSwitch() {
+    private fun updateActiveForegroundApp(server: LocalSocks5Server) {
         val activePkg = detectForegroundUserPackage()
-        if (activePkg != lastActiveUserApp) {
-            lastActiveUserApp = activePkg
-            socksServer?.refresh()
-            startVpn(cachedThrottled, cachedBlocked, currentKbps)
+        if (activePkg != lastActivePkg) {
+            lastActivePkg = activePkg
+            // تفريغ المقابس القديمة فوراً عند الانتقال من تطبيق لآخر
+            server.refresh()
+        }
+        val uid = if (activePkg != null) userAppUids[activePkg] ?: -1 else -1
+        server.foregroundOnlyEnabled = true
+        server.allowedForegroundUid = uid
+        routingModeDesc = if (activePkg != null) {
+            "النشط: ${activePkg.substringAfterLast('.')}"
+        } else {
+            "النشط فقط: الخلفية محظورة"
         }
     }
 
@@ -258,6 +282,7 @@ class ThrottleVpnService : VpnService() {
 
         try {
             val server = LocalSocks5Server(this, downloadLimiter, uploadLimiter, udpLimiter)
+            server.foregroundOnlyEnabled = foregroundOnlyMode
             server.start()
             socksServer = server
             lastDownBytes = 0L
@@ -271,33 +296,17 @@ class ThrottleVpnService : VpnService() {
                 .addDnsServer("8.8.8.8")
                 .addDnsServer("1.1.1.1")
 
-            var activeTunnelEnabled = true
-
             if (foregroundOnlyMode) {
-                // وضع التطبيق النشط فقط: تطبيقات النظام مستثناة تلقائياً،
-                // والمفتوح على الشاشة فقط يعمل بالسرعة المحددة بينما البقية محظورة
-                val currentApp = lastActiveUserApp
-                if (currentApp != null) {
+                // إدخال تطبيقات المستخدم فقط (تطبيقات النظام مستثناة ومحمية بالكامل)
+                for (pkg in userAppUids.keys) {
                     try {
-                        builder.addAllowedApplication(currentApp)
-                        routingModeDesc = "النشط فقط: $currentApp"
+                        builder.addAllowedApplication(pkg)
                     } catch (_: Exception) {
-                        activeTunnelEnabled = false
-                        routingModeDesc = "النشط فقط: وضع السكون"
                     }
-                } else {
-                    // كل تطبيقات المستخدم تدخل النفق بدون تشغيل الخادم (حظر كامل للخلفية مع حماية النظام)
-                    for (pkg in userInstalledPackages) {
-                        try {
-                            builder.addAllowedApplication(pkg)
-                        } catch (_: Exception) {
-                        }
-                    }
-                    activeTunnelEnabled = false
-                    routingModeDesc = "النشط فقط: الخلفية محظورة"
                 }
+                routingModeDesc = "النشط فقط: جاري الرصد"
             } else if (throttledPackages.isEmpty() && blockedPackages.isEmpty()) {
-                for (pkg in userInstalledPackages) {
+                for (pkg in userAppUids.keys) {
                     try {
                         builder.addAllowedApplication(pkg)
                     } catch (_: Exception) {
@@ -315,7 +324,7 @@ class ThrottleVpnService : VpnService() {
                     }
                 }
                 if (addedCount == 0) {
-                    for (pkg in userInstalledPackages) {
+                    for (pkg in userAppUids.keys) {
                         try {
                             builder.addAllowedApplication(pkg)
                         } catch (_: Exception) {
@@ -335,37 +344,31 @@ class ThrottleVpnService : VpnService() {
             }
             vpnInterface = pfd
 
-            if (activeTunnelEnabled) {
-                val configFile = File(cacheDir, "tproxy.conf")
-                configFile.writeText(
-                    """
-                    tunnel:
-                      name: tun0
-                      mtu: 1500
-                      multi-queue: false
-                      ipv4: 10.0.0.2
-                    socks5:
-                      port: ${server.port}
-                      address: 127.0.0.1
-                      udp: 'udp'
-                    misc:
-                      task-stack-size: 81920
-                      tcp-buffer-size: 2048
-                      connect-timeout: 5000
-                      read-write-timeout: 60000
-                      log-level: warn
-                    """.trimIndent()
-                )
-                TProxyService.TProxyStartService(configFile.absolutePath, pfd.fd)
-            } else {
-                // إيقاف خادم التمرير ليتم إسقاط حزم تطبيقات الخلفية فوراً دون استهلاك أي بايت
-                server.stop()
-                socksServer = null
-            }
+            val configFile = File(cacheDir, "tproxy.conf")
+            configFile.writeText(
+                """
+                tunnel:
+                  name: tun0
+                  mtu: 1500
+                  multi-queue: false
+                  ipv4: 10.0.0.2
+                socks5:
+                  port: ${server.port}
+                  address: 127.0.0.1
+                  udp: 'udp'
+                misc:
+                  task-stack-size: 81920
+                  tcp-buffer-size: 2048
+                  connect-timeout: 5000
+                  read-write-timeout: 60000
+                  log-level: warn
+                """.trimIndent()
+            )
 
+            TProxyService.TProxyStartService(configFile.absolutePath, pfd.fd)
             isRunning = true
             diagnosticStatus = "نشط ($routingModeDesc) | الحد: $kbps KB/s"
-            updateNotification("الحد: $kbps KB/s ($routingModeDesc)")
+            updateNotification("الحد: $kbps KB/s")
 
             handler.removeCallbacks(statsRunnable)
             handler.postDelayed(statsRunnable, 1000L)
