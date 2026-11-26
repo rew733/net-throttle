@@ -1,6 +1,10 @@
 package com.rew733.netthrottle
 
+import android.content.Context
+import android.net.ConnectivityManager
 import android.net.VpnService
+import android.os.Build
+import android.system.OsConstants
 import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.io.InputStream
@@ -21,9 +25,14 @@ class LocalSocks5Server(
 ) {
     private var serverSocket: ServerSocket? = null
     private val executor = Executors.newCachedThreadPool()
+    private val connectivityManager =
+        vpnService.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
 
     @Volatile
     private var running = false
+
+    @Volatile
+    var blockedUids: Set<Int> = emptySet()
 
     val port: Int = 10808
 
@@ -57,12 +66,33 @@ class LocalSocks5Server(
         serverSocket = null
     }
 
+    private fun isConnectionBlocked(
+        protocol: Int,
+        srcPort: Int,
+        dstHost: String,
+        dstPort: Int
+    ): Boolean {
+        val blocked = blockedUids
+        if (blocked.isEmpty()) return false
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            try {
+                val localAddr = InetSocketAddress(InetAddress.getByName("10.0.0.2"), srcPort)
+                val remoteAddr = InetSocketAddress(InetAddress.getByName(dstHost), dstPort)
+                val uid = connectivityManager.getConnectionOwnerUid(protocol, localAddr, remoteAddr)
+                if (uid > 0 && blocked.contains(uid)) {
+                    return true
+                }
+            } catch (_: Exception) {
+            }
+        }
+        return false
+    }
+
     private fun handleClient(client: Socket) {
         try {
             val input = DataInputStream(client.getInputStream())
             val output = DataOutputStream(client.getOutputStream())
 
-            // 1. SOCKS5 Greeting
             val version = input.readUnsignedByte()
             if (version != 0x05) {
                 client.close()
@@ -72,29 +102,27 @@ class LocalSocks5Server(
             val methods = ByteArray(nMethods)
             input.readFully(methods)
 
-            // Respond: No authentication required (0x00)
             output.write(byteArrayOf(0x05, 0x00))
             output.flush()
 
-            // 2. SOCKS5 Request
-            val reqVer = input.readUnsignedByte()
+            input.readUnsignedByte() // VER
             val cmd = input.readUnsignedByte()
             input.readUnsignedByte() // RSV
             val atyp = input.readUnsignedByte()
 
             val destHost: String = when (atyp) {
-                0x01 -> { // IPv4
+                0x01 -> {
                     val addr = ByteArray(4)
                     input.readFully(addr)
                     InetAddress.getByAddress(addr).hostAddress ?: ""
                 }
-                0x03 -> { // Domain name
+                0x03 -> {
                     val len = input.readUnsignedByte()
                     val domain = ByteArray(len)
                     input.readFully(domain)
                     String(domain, Charsets.UTF_8)
                 }
-                0x04 -> { // IPv6
+                0x04 -> {
                     val addr = ByteArray(16)
                     input.readFully(addr)
                     InetAddress.getByAddress(addr).hostAddress ?: ""
@@ -130,23 +158,32 @@ class LocalSocks5Server(
         host: String,
         port: Int
     ) {
+        // التحقق مما إذا كان التطبيق محظوراً
+        if (isConnectionBlocked(OsConstants.IPPROTO_TCP, client.port, host, port)) {
+            try {
+                clientOut.write(byteArrayOf(0x05, 0x02, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
+                clientOut.flush()
+                client.close()
+            } catch (_: Exception) {
+            }
+            return
+        }
+
         val remote = Socket()
         try {
             vpnService.protect(remote)
             remote.tcpNoDelay = true
-            remote.receiveBufferSize = 8192
+            remote.receiveBufferSize = 2048
             remote.connect(InetSocketAddress(host, port), 10000)
 
-            // Reply success
             clientOut.write(byteArrayOf(0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
             clientOut.flush()
 
             val remoteIn = remote.getInputStream()
             val remoteOut = remote.getOutputStream()
 
-            // Upstream: App -> Internet
             val upFuture = executor.submit {
-                val buf = ByteArray(2048)
+                val buf = ByteArray(1024)
                 try {
                     while (running && !client.isClosed && !remote.isClosed) {
                         val read = clientIn.read(buf)
@@ -166,8 +203,7 @@ class LocalSocks5Server(
                 }
             }
 
-            // Downstream: Internet -> App
-            val buf = ByteArray(1024)
+            val buf = ByteArray(512)
             try {
                 while (running && !client.isClosed && !remote.isClosed) {
                     val read = remoteIn.read(buf)
@@ -231,7 +267,6 @@ class LocalSocks5Server(
                     val len = packet.length
                     if (len < 10) continue
 
-                    // Packet from local tunnel
                     if (packet.address.isLoopbackAddress && (clientAppAddr == null || packet.port == clientAppAddr.port)) {
                         clientAppAddr = InetSocketAddress(packet.address, packet.port)
                         val atyp = buf[3].toInt() and 0xFF
@@ -254,8 +289,20 @@ class LocalSocks5Server(
                         val destPort = ((buf[offset].toInt() and 0xFF) shl 8) or (buf[offset + 1].toInt() and 0xFF)
                         offset += 2
 
-                        // حظر QUIC (UDP 443) لتحويل الفيديو إلى TCP المنضبط، مع السماح لـ DNS (53)
+                        // حظر QUIC (UDP 443) لتحويل الفيديو إلى TCP المنضبط
                         if (destPort == 443 || destPort == 80) continue
+
+                        // حظر استعلامات UDP/DNS للتطبيقات المحظورة
+                        val destHostStr = destAddr.hostAddress ?: ""
+                        if (destHostStr.isNotEmpty() && isConnectionBlocked(
+                                OsConstants.IPPROTO_UDP,
+                                packet.port,
+                                destHostStr,
+                                destPort
+                            )
+                        ) {
+                            continue
+                        }
 
                         val payload = buf.copyOfRange(offset, len)
                         if (destPort != 53) {
@@ -302,7 +349,6 @@ class LocalSocks5Server(
             }
         }
 
-        // Keep TCP control connection alive until closed by tunnel
         try {
             while (running && clientIn.read() != -1) {
             }
