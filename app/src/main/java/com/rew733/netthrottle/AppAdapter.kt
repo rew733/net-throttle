@@ -9,47 +9,65 @@ import android.widget.ImageView
 import android.widget.TextView
 import androidx.recyclerview.widget.RecyclerView
 
-data class AppItem(
+data class AppInfo(
     val name: String,
     val packageName: String,
-    val icon: Drawable
+    val icon: Drawable,
+    val uid: Int
 )
 
 class AppAdapter(
-    private val selectedPackages: MutableSet<String>,
     private val onSelectionChanged: () -> Unit
 ) : RecyclerView.Adapter<AppAdapter.AppViewHolder>() {
 
-    private var fullList: List<AppItem> = emptyList()
-    private var filteredList: List<AppItem> = emptyList()
-    private var currentQuery: String = ""
+    private var allApps: List<AppInfo> = emptyList()
+    private var filteredApps: List<AppInfo> = emptyList()
+    private var searchQuery: String = ""
 
-    fun submitList(apps: List<AppItem>) {
-        fullList = apps
-        filter(currentQuery)
+    // 0 = تبويب تحديد السرعة ، 1 = تبويب حظر البيانات
+    var currentTab: Int = 0
+        set(value) {
+            field = value
+            notifyDataSetChanged()
+        }
+
+    val throttledPackages = mutableSetOf<String>()
+    val blockedPackages = mutableSetOf<String>()
+
+    fun submitList(apps: List<AppInfo>) {
+        allApps = apps
+        applyFilter(searchQuery)
     }
 
-    fun filter(query: String) {
-        currentQuery = query.trim().lowercase()
-        filteredList = if (currentQuery.isEmpty()) {
-            fullList
+    fun applyFilter(query: String) {
+        searchQuery = query.trim()
+        filteredApps = if (searchQuery.isEmpty()) {
+            allApps
         } else {
-            fullList.filter {
-                it.name.lowercase().contains(currentQuery) ||
-                        it.packageName.lowercase().contains(currentQuery)
+            allApps.filter {
+                it.name.contains(searchQuery, ignoreCase = true) ||
+                        it.packageName.contains(searchQuery, ignoreCase = true)
             }
         }
         notifyDataSetChanged()
     }
 
     fun selectAllVisible() {
-        filteredList.forEach { selectedPackages.add(it.packageName) }
+        val targetSet = if (currentTab == 0) throttledPackages else blockedPackages
+        val oppositeSet = if (currentTab == 0) blockedPackages else throttledPackages
+        for (app in filteredApps) {
+            targetSet.add(app.packageName)
+            oppositeSet.remove(app.packageName)
+        }
         notifyDataSetChanged()
         onSelectionChanged()
     }
 
-    fun deselectAll() {
-        selectedPackages.clear()
+    fun deselectAllVisible() {
+        val targetSet = if (currentTab == 0) throttledPackages else blockedPackages
+        for (app in filteredApps) {
+            targetSet.remove(app.packageName)
+        }
         notifyDataSetChanged()
         onSelectionChanged()
     }
@@ -61,34 +79,39 @@ class AppAdapter(
     }
 
     override fun onBindViewHolder(holder: AppViewHolder, position: Int) {
-        val item = filteredList[position]
-        holder.ivIcon.setImageDrawable(item.icon)
-        holder.tvName.text = item.name
-        holder.tvPackage.text = item.packageName
+        val app = filteredApps[position]
+        holder.tvName.text = app.name
+        holder.tvPkg.text = app.packageName
+        holder.ivIcon.setImageDrawable(app.icon)
 
-        holder.cbSelect.setOnCheckedChangeListener(null)
-        holder.cbSelect.isChecked = selectedPackages.contains(item.packageName)
+        val targetSet = if (currentTab == 0) throttledPackages else blockedPackages
+        val oppositeSet = if (currentTab == 0) blockedPackages else throttledPackages
 
-        holder.itemView.setOnClickListener {
-            holder.cbSelect.isChecked = !holder.cbSelect.isChecked
-        }
+        holder.cbSelected.setOnCheckedChangeListener(null)
+        holder.cbSelected.isChecked = targetSet.contains(app.packageName)
 
-        holder.cbSelect.setOnCheckedChangeListener { _, isChecked ->
-            if (isChecked) {
-                selectedPackages.add(item.packageName)
+        val toggleAction = {
+            val newState = !targetSet.contains(app.packageName)
+            if (newState) {
+                targetSet.add(app.packageName)
+                oppositeSet.remove(app.packageName)
             } else {
-                selectedPackages.remove(item.packageName)
+                targetSet.remove(app.packageName)
             }
+            holder.cbSelected.isChecked = newState
             onSelectionChanged()
         }
+
+        holder.itemView.setOnClickListener { toggleAction() }
+        holder.cbSelected.setOnClickListener { toggleAction() }
     }
 
-    override fun getItemCount(): Int = filteredList.size
+    override fun getItemCount(): Int = filteredApps.size
 
     class AppViewHolder(view: View) : RecyclerView.ViewHolder(view) {
         val ivIcon: ImageView = view.findViewById(R.id.ivAppIcon)
         val tvName: TextView = view.findViewById(R.id.tvAppName)
-        val tvPackage: TextView = view.findViewById(R.id.tvPackageName)
-        val cbSelect: CheckBox = view.findViewById(R.id.cbSelectApp)
+        val tvPkg: TextView = view.findViewById(R.id.tvPackageName)
+        val cbSelected: CheckBox = view.findViewById(R.id.cbAppSelected)
     }
 }
