@@ -14,6 +14,8 @@ import java.net.Socket
 import java.nio.ByteBuffer
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 
 class LocalSocks5Server(
     private val vpnService: VpnService,
@@ -23,6 +25,14 @@ class LocalSocks5Server(
     private var serverSocket: ServerSocket? = null
     private val executor = Executors.newCachedThreadPool()
     private val activeSockets = ConcurrentHashMap.newKeySet<Socket>()
+
+    val totalDownloadBytes = AtomicLong(0L)
+    val totalUploadBytes = AtomicLong(0L)
+    val activeConnections = AtomicInteger(0)
+    val errorCount = AtomicInteger(0)
+
+    @Volatile
+    var lastError: String = "لا توجد أخطاء"
 
     @Volatile
     private var running = false
@@ -46,8 +56,13 @@ class LocalSocks5Server(
                     client.sendBufferSize = 1024
                     activeSockets.add(client)
                     executor.execute { handleClient(client) }
-                } catch (_: Exception) {
-                    if (!running) break
+                } catch (e: Exception) {
+                    if (running) {
+                        errorCount.incrementAndGet()
+                        lastError = "Accept: ${e.javaClass.simpleName}"
+                    } else {
+                        break
+                    }
                 }
             }
         }
@@ -63,6 +78,7 @@ class LocalSocks5Server(
             }
             iterator.remove()
         }
+        activeConnections.set(0)
     }
 
     fun stop() {
@@ -76,6 +92,7 @@ class LocalSocks5Server(
     }
 
     private fun handleClient(client: Socket) {
+        activeConnections.incrementAndGet()
         try {
             val input = DataInputStream(client.getInputStream())
             val output = DataOutputStream(client.getOutputStream())
@@ -130,13 +147,19 @@ class LocalSocks5Server(
                     client.close()
                 }
             }
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            if (running && e.message?.contains("closed", ignoreCase = true) != true) {
+                errorCount.incrementAndGet()
+                lastError = "Client: ${e.javaClass.simpleName}"
+            }
             try {
                 client.close()
             } catch (_: Exception) {
             }
         } finally {
             activeSockets.remove(client)
+            val current = activeConnections.decrementAndGet()
+            if (current < 0) activeConnections.set(0)
         }
     }
 
@@ -170,6 +193,7 @@ class LocalSocks5Server(
                         if (read == -1) break
                         if (read > 0) {
                             uploadLimiter.consume(read)
+                            totalUploadBytes.addAndGet(read.toLong())
                             remoteOut.write(buf, 0, read)
                             remoteOut.flush()
                         }
@@ -190,6 +214,7 @@ class LocalSocks5Server(
                     if (read == -1) break
                     if (read > 0) {
                         downloadLimiter.consume(read)
+                        totalDownloadBytes.addAndGet(read.toLong())
                         clientOut.write(buf, 0, read)
                         clientOut.flush()
                     }
@@ -198,7 +223,11 @@ class LocalSocks5Server(
             } finally {
                 upFuture.cancel(true)
             }
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            if (running && e.message?.contains("closed", ignoreCase = true) != true) {
+                errorCount.incrementAndGet()
+                lastError = "TCP($host:$port): ${e.javaClass.simpleName}"
+            }
             try {
                 clientOut.write(byteArrayOf(0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
                 clientOut.flush()
@@ -276,6 +305,7 @@ class LocalSocks5Server(
                         val payload = buf.copyOfRange(offset, len)
                         if (destPort != 53) {
                             uploadLimiter.consume(payload.size)
+                            totalUploadBytes.addAndGet(payload.size.toLong())
                         }
 
                         val outSock = DatagramSocket()
@@ -290,6 +320,7 @@ class LocalSocks5Server(
                                 val rData = rPkt.data.copyOf(rPkt.length)
                                 if (destPort != 53) {
                                     downloadLimiter.consume(rData.size)
+                                    totalDownloadBytes.addAndGet(rData.size.toLong())
                                 }
 
                                 val srcIpBytes = destAddr.address
