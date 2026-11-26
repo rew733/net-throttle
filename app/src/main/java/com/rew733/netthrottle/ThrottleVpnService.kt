@@ -30,9 +30,25 @@ class ThrottleVpnService : VpnService() {
         var isRunning = false
             private set
 
+        @Volatile
+        var liveDownKbps: Int = 0
+            private set
+
+        @Volatile
+        var liveUpKbps: Int = 0
+            private set
+
+        @Volatile
+        var liveConnections: Int = 0
+            private set
+
+        @Volatile
+        var diagnosticStatus: String = "الحالة: متوقف"
+            private set
+
         private const val CHANNEL_ID = "net_throttle_vpn"
         private const val NOTIF_ID = 101
-        private const val AUTO_REFRESH_INTERVAL_MS = 5 * 60 * 1000L // 5 دقائق
+        private const val AUTO_REFRESH_INTERVAL_MS = 5 * 60 * 1000L
     }
 
     private var vpnInterface: ParcelFileDescriptor? = null
@@ -40,8 +56,33 @@ class ThrottleVpnService : VpnService() {
     private val uploadLimiter = TokenBucketLimiter(100 * 1024L)
     private var socksServer: LocalSocks5Server? = null
     private var currentKbps: Int = 100
+    private var routingModeDesc: String = ""
+
+    private var lastDownBytes = 0L
+    private var lastUpBytes = 0L
 
     private val handler = Handler(Looper.getMainLooper())
+
+    private val statsRunnable = object : Runnable {
+        override fun run() {
+            if (isRunning) {
+                val server = socksServer
+                if (server != null) {
+                    val curDown = server.totalDownloadBytes.get()
+                    val curUp = server.totalUploadBytes.get()
+                    liveDownKbps = ((curDown - lastDownBytes) / 1024L).toInt().coerceAtLeast(0)
+                    liveUpKbps = ((curUp - lastUpBytes) / 1024L).toInt().coerceAtLeast(0)
+                    lastDownBytes = curDown
+                    lastUpBytes = curUp
+                    liveConnections = server.activeConnections.get()
+                    val errs = server.errorCount.get()
+                    diagnosticStatus = "نشط ($routingModeDesc) | الحد: $currentKbps KB/s | أخطاء: $errs (${server.lastError})"
+                }
+                handler.postDelayed(this, 1000L)
+            }
+        }
+    }
+
     private val autoRefreshRunnable = object : Runnable {
         override fun run() {
             if (isRunning) {
@@ -94,7 +135,9 @@ class ThrottleVpnService : VpnService() {
             downloadLimiter.updateRate(bytesPerSec)
             uploadLimiter.updateRate(bytesPerSec)
             updateNotification("الحد: $currentKbps KB/s ($reason)")
-        } catch (_: Throwable) {
+            diagnosticStatus = "$reason | الحد: $currentKbps KB/s | تم تصفير المقابس"
+        } catch (t: Throwable) {
+            diagnosticStatus = "خطأ تحديث: ${t.message}"
         }
     }
 
@@ -150,6 +193,8 @@ class ThrottleVpnService : VpnService() {
             val server = LocalSocks5Server(this, downloadLimiter, uploadLimiter)
             server.start()
             socksServer = server
+            lastDownBytes = 0L
+            lastUpBytes = 0L
 
             val builder = Builder()
                 .setSession("NetThrottle")
@@ -161,8 +206,10 @@ class ThrottleVpnService : VpnService() {
 
             if (throttledPackages.isEmpty() && blockedPackages.isEmpty()) {
                 builder.addDisallowedApplication(packageName)
+                routingModeDesc = "شامل للهاتف"
             } else if (blockedPackages.isNotEmpty()) {
                 builder.addDisallowedApplication(packageName)
+                routingModeDesc = "شامل + حظر (${blockedPackages.size})"
             } else {
                 var addedCount = 0
                 for (pkg in throttledPackages) {
@@ -175,11 +222,15 @@ class ThrottleVpnService : VpnService() {
                 }
                 if (addedCount == 0) {
                     builder.addDisallowedApplication(packageName)
+                    routingModeDesc = "شامل للهاتف"
+                } else {
+                    routingModeDesc = "محدد ($addedCount تطبيق)"
                 }
             }
 
             val pfd = builder.establish()
             if (pfd == null) {
+                diagnosticStatus = "خطأ: فشل إنشاء واجهة VPN"
                 updateNotification("فشل إنشاء واجهة VPN")
                 return
             }
@@ -208,17 +259,23 @@ class ThrottleVpnService : VpnService() {
 
             TProxyService.TProxyStartService(configFile.absolutePath, pfd.fd)
             isRunning = true
-            updateNotification("الحد الكلي للهاتف: $kbps KB/s")
+            diagnosticStatus = "نشط ($routingModeDesc) | الحد: $kbps KB/s"
+            updateNotification("الحد: $kbps KB/s")
+
+            handler.removeCallbacks(statsRunnable)
+            handler.postDelayed(statsRunnable, 1000L)
 
             handler.removeCallbacks(autoRefreshRunnable)
             handler.postDelayed(autoRefreshRunnable, AUTO_REFRESH_INTERVAL_MS)
         } catch (t: Throwable) {
             isRunning = false
-            updateNotification("خطأ: ${t.javaClass.simpleName}: ${t.message}")
+            diagnosticStatus = "استثناء: ${t.javaClass.simpleName}: ${t.message}"
+            updateNotification("خطأ: ${t.javaClass.simpleName}")
         }
     }
 
     private fun stopVpnInternal() {
+        handler.removeCallbacks(statsRunnable)
         handler.removeCallbacks(autoRefreshRunnable)
         if (isRunning) {
             try {
@@ -227,6 +284,10 @@ class ThrottleVpnService : VpnService() {
             }
         }
         isRunning = false
+        liveDownKbps = 0
+        liveUpKbps = 0
+        liveConnections = 0
+        diagnosticStatus = "الحالة: متوقف"
         socksServer?.stop()
         socksServer = null
         try {
