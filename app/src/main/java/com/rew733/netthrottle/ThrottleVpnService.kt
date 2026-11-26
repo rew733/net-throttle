@@ -67,7 +67,7 @@ class ThrottleVpnService : VpnService() {
     private var routingModeDesc: String = ""
 
     private var foregroundOnlyMode: Boolean = false
-    private var userPackages: Set<String> = emptySet()
+    private var userAppNames: Map<String, String> = emptyMap()
     private var lastDetectedActivePkg: String? = null
     private var currentTunnelTargetPkg: String? = "__NONE__"
 
@@ -144,7 +144,7 @@ class ThrottleVpnService : VpnService() {
                 foregroundOnlyMode = intent.getBooleanExtra(EXTRA_FOREGROUND_ONLY_MODE, false)
                 currentKbps = intent.getIntExtra(EXTRA_SPEED_KBPS, 100).coerceAtLeast(1)
                 applySpeedLimits(currentKbps)
-                userPackages = collectUserPackages()
+                userAppNames = collectUserPackagesWithLabels()
                 lastDetectedActivePkg = null
                 currentTunnelTargetPkg = "__NONE__"
                 startForegroundServiceWithNotification("جاري التشغيل...")
@@ -154,7 +154,7 @@ class ThrottleVpnService : VpnService() {
         return START_STICKY
     }
 
-    private fun collectUserPackages(): Set<String> {
+    private fun collectUserPackagesWithLabels(): Map<String, String> {
         val pm = packageManager
         val list = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             pm.getInstalledApplications(PackageManager.ApplicationInfoFlags.of(0))
@@ -162,11 +162,16 @@ class ThrottleVpnService : VpnService() {
             @Suppress("DEPRECATION")
             pm.getInstalledApplications(0)
         }
-        return list.filter { info ->
-            info.packageName != packageName &&
-                    (info.flags and ApplicationInfo.FLAG_SYSTEM) == 0 &&
-                    pm.getLaunchIntentForPackage(info.packageName) != null
-        }.map { it.packageName }.toSet()
+        val map = mutableMapOf<String, String>()
+        for (info in list) {
+            if (info.packageName != packageName &&
+                (info.flags and ApplicationInfo.FLAG_SYSTEM) == 0 &&
+                pm.getLaunchIntentForPackage(info.packageName) != null
+            ) {
+                map[info.packageName] = pm.getApplicationLabel(info).toString()
+            }
+        }
+        return map
     }
 
     private fun detectForegroundUserPackage(): String? {
@@ -189,7 +194,7 @@ class ThrottleVpnService : VpnService() {
         lastDetectedActivePkg = candidate
 
         if (candidate == packageName) return null
-        return if (userPackages.contains(candidate)) candidate else null
+        return if (userAppNames.containsKey(candidate)) candidate else null
     }
 
     private fun monitorAndRouteActiveApp(server: LocalSocks5Server) {
@@ -198,7 +203,8 @@ class ThrottleVpnService : VpnService() {
         server.hasActiveForegroundApp = (activePkg != null)
 
         routingModeDesc = if (activePkg != null) {
-            "النشط: ${activePkg.substringAfterLast('.')}"
+            val label = userAppNames[activePkg] ?: activePkg.substringAfterLast('.')
+            "النشط: $label"
         } else {
             "النشط فقط: الخلفية محظورة"
         }
@@ -206,12 +212,12 @@ class ThrottleVpnService : VpnService() {
         if (activePkg != currentTunnelTargetPkg) {
             currentTunnelTargetPkg = activePkg
             server.refresh()
-            rebuildVpnInterfaceForTarget(activePkg)
+            rebuildVpnInterfaceForTarget()
             updateNotification("$routingModeDesc | الحد: $currentKbps KB/s")
         }
     }
 
-    private fun rebuildVpnInterfaceForTarget(targetPkg: String?) {
+    private fun rebuildVpnInterfaceForTarget() {
         try {
             val builder = Builder()
                 .setSession("NetThrottle")
@@ -221,7 +227,7 @@ class ThrottleVpnService : VpnService() {
                 .addDnsServer("8.8.8.8")
                 .addDnsServer("1.1.1.1")
 
-            for (pkg in userPackages) {
+            for (pkg in userAppNames.keys) {
                 try {
                     builder.addAllowedApplication(pkg)
                 } catch (_: Exception) {
@@ -344,7 +350,7 @@ class ThrottleVpnService : VpnService() {
                 .addDnsServer("1.1.1.1")
 
             if (foregroundOnlyMode || (throttledPackages.isEmpty() && blockedPackages.isEmpty())) {
-                for (pkg in userPackages) {
+                for (pkg in userAppNames.keys) {
                     try {
                         builder.addAllowedApplication(pkg)
                     } catch (_: Exception) {
@@ -362,7 +368,7 @@ class ThrottleVpnService : VpnService() {
                     }
                 }
                 if (addedCount == 0) {
-                    for (pkg in userPackages) {
+                    for (pkg in userAppNames.keys) {
                         try {
                             builder.addAllowedApplication(pkg)
                         } catch (_: Exception) {
