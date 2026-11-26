@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">NetThrottle</string>
+    <string name="start_vpn">تشغيل التحديد</string>
+    <string name="stop_vpn">إيقاف التحديد</string>
+    <string name="search_hint">ابحث عن تطبيق...</string>
+    <string name="speed_limit_label">الحد الأقصى للسرعة (KB/s):</string>
+    <string name="select_all">تحديد الكل</string>
+    <string name="deselect_all">إلغاء الكل</string>
+</resources>
