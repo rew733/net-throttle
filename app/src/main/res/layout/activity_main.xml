@@ -7,7 +7,7 @@
     android:background="#121212"
     android:padding="14dp">
 
-    <!-- العنوان وزر التشغيل -->
+    <!-- الشريط العلوي: العنوان + زر التحديث اليدوي + زر التشغيل/الإيقاف -->
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
@@ -25,6 +25,16 @@
             android:textStyle="bold" />
 
         <com.google.android.material.button.MaterialButton
+            android:id="@+id/btnRefresh"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="تحديث"
+            android:textColor="#FFFFFF"
+            android:layout_marginEnd="8dp"
+            app:backgroundTint="#2E7D32"
+            app:cornerRadius="12dp" />
+
+        <com.google.android.material.button.MaterialButton
             android:id="@+id/btnToggleVpn"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
@@ -34,50 +44,52 @@
             app:cornerRadius="12dp" />
     </LinearLayout>
 
-    <!-- شريط التحكم بالسرعة -->
+    <!-- بطاقة إدخال السرعة كتابةً -->
     <LinearLayout
         android:id="@+id/speedControlCard"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:orientation="vertical"
+        android:orientation="horizontal"
+        android:gravity="center_vertical"
         android:background="#1E1E1E"
         android:padding="12dp"
         android:layout_marginBottom="10dp">
 
-        <LinearLayout
-            android:layout_width="match_parent"
+        <TextView
+            android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:orientation="horizontal"
-            android:gravity="center_vertical">
+            android:text="الحد الأقصى (KB/s):"
+            android:textColor="#CCCCCC"
+            android:textSize="14sp"
+            android:layout_marginEnd="10dp" />
 
-            <TextView
-                android:layout_width="0dp"
-                android:layout_height="wrap_content"
-                android:layout_weight="1"
-                android:text="الحد الأقصى للسرعة:"
-                android:textColor="#CCCCCC"
-                android:textSize="14sp" />
+        <EditText
+            android:id="@+id/etSpeedInput"
+            android:layout_width="0dp"
+            android:layout_height="44dp"
+            android:layout_weight="1"
+            android:background="#2A2A2A"
+            android:inputType="number"
+            android:maxLength="6"
+            android:gravity="center"
+            android:text="100"
+            android:textColor="#4FC3F7"
+            android:textSize="17sp"
+            android:textStyle="bold"
+            android:singleLine="true"
+            android:layout_marginEnd="8dp" />
 
-            <TextView
-                android:id="@+id/tvSpeedValue"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:text="100 KB/s"
-                android:textColor="#4FC3F7"
-                android:textSize="16sp"
-                android:textStyle="bold" />
-        </LinearLayout>
-
-        <SeekBar
-            android:id="@+id/seekBarSpeed"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:max="1000"
-            android:progress="100"
-            android:layout_marginTop="6dp" />
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/btnApplySpeed"
+            android:layout_width="wrap_content"
+            android:layout_height="44dp"
+            android:text="تطبيق"
+            android:textColor="#FFFFFF"
+            app:backgroundTint="#0288D1"
+            app:cornerRadius="10dp" />
     </LinearLayout>
 
-    <!-- التبويبات: تحديد السرعة / حظر التطبيقات -->
+    <!-- التبويبات: تحديد السرعة / حظر البيانات -->
     <com.google.android.material.tabs.TabLayout
         android:id="@+id/tabLayout"
         android:layout_width="match_parent"
