@@ -127,7 +127,7 @@ class ThrottleVpnService : VpnService() {
             ACTION_UPDATE_SPEED -> {
                 currentKbps = intent.getIntExtra(EXTRA_SPEED_KBPS, 100).coerceAtLeast(1)
                 applySpeedLimits(currentKbps)
-                updateNotification("الحد الكلي: $currentKbps KB/s")
+                updateNotification("$routingModeDesc | الحد: $currentKbps KB/s")
                 return START_STICKY
             }
             ACTION_REFRESH -> {
@@ -175,7 +175,6 @@ class ThrottleVpnService : VpnService() {
 
         val usm = getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
         val now = System.currentTimeMillis()
-        // فحص أحداث الانتقال للواجهة خلال آخر دقيقتين
         val events = usm.queryEvents(now - 120_000L, now)
         val event = UsageEvents.Event()
         var latestEventPkg: String? = null
@@ -189,7 +188,6 @@ class ThrottleVpnService : VpnService() {
         val candidate = latestEventPkg ?: lastDetectedActivePkg ?: return null
         lastDetectedActivePkg = candidate
 
-        // إذا كان التطبيق المفتوح هو NetThrottle نفسه أو مشغل الشاشة، نوقف تمرير البيانات
         if (candidate == packageName) return null
         return if (userPackages.contains(candidate)) candidate else null
     }
@@ -199,16 +197,17 @@ class ThrottleVpnService : VpnService() {
         server.foregroundOnlyEnabled = true
         server.hasActiveForegroundApp = (activePkg != null)
 
-        if (activePkg != currentTunnelTargetPkg) {
-            currentTunnelTargetPkg = activePkg
-            server.refresh()
-            rebuildVpnInterfaceForTarget(activePkg)
-        }
-
         routingModeDesc = if (activePkg != null) {
             "النشط: ${activePkg.substringAfterLast('.')}"
         } else {
             "النشط فقط: الخلفية محظورة"
+        }
+
+        if (activePkg != currentTunnelTargetPkg) {
+            currentTunnelTargetPkg = activePkg
+            server.refresh()
+            rebuildVpnInterfaceForTarget(activePkg)
+            updateNotification("$routingModeDesc | الحد: $currentKbps KB/s")
         }
     }
 
@@ -222,28 +221,10 @@ class ThrottleVpnService : VpnService() {
                 .addDnsServer("8.8.8.8")
                 .addDnsServer("1.1.1.1")
 
-            if (targetPkg != null) {
-                // عزل التطبيق المفتوح فقط داخل النفق، بينما تُحظر بقية تطبيقات المستخدم
-                // وتُستثنى تطبيقات النظام بالكامل
-                for (pkg in userPackages) {
-                    if (pkg != targetPkg) {
-                        // تطبيقات الخلفية: لا نضيفها للنفق إذا أردنا حظرها عبر نفق ثانٍ،
-                        // لكن أندرويد يسمح بنفق واحد فقط؛ لذلك ندخل كل تطبيقات المستخدم
-                        // ونسمح للتطبيق المفتوح فقط بالمرور في الخادم
-                    }
-                }
-                for (pkg in userPackages) {
-                    try {
-                        builder.addAllowedApplication(pkg)
-                    } catch (_: Exception) {
-                    }
-                }
-            } else {
-                for (pkg in userPackages) {
-                    try {
-                        builder.addAllowedApplication(pkg)
-                    } catch (_: Exception) {
-                    }
+            for (pkg in userPackages) {
+                try {
+                    builder.addAllowedApplication(pkg)
+                } catch (_: Exception) {
                 }
             }
 
@@ -290,7 +271,7 @@ class ThrottleVpnService : VpnService() {
         try {
             socksServer?.refresh()
             applySpeedLimits(currentKbps)
-            updateNotification("الحد: $currentKbps KB/s ($reason)")
+            updateNotification("$routingModeDesc | الحد: $currentKbps KB/s ($reason)")
             diagnosticStatus = "$reason | الحد: $currentKbps KB/s | تم تصفير المقابس"
         } catch (t: Throwable) {
             diagnosticStatus = "خطأ تحديث: ${t.message}"
@@ -425,7 +406,7 @@ class ThrottleVpnService : VpnService() {
             TProxyService.TProxyStartService(configFile.absolutePath, pfd.fd)
             isRunning = true
             diagnosticStatus = "نشط ($routingModeDesc) | الحد: $kbps KB/s"
-            updateNotification("الحد: $kbps KB/s")
+            updateNotification("$routingModeDesc | الحد: $kbps KB/s")
 
             handler.removeCallbacks(statsRunnable)
             handler.postDelayed(statsRunnable, 500L)
