@@ -1,8 +1,15 @@
 package hev.htproxy
 
 object TProxyService {
+    var loadError: String? = null
+        private set
+
     init {
-        System.loadLibrary("hev-socks5-tunnel")
+        try {
+            System.loadLibrary("hev-socks5-tunnel")
+        } catch (t: Throwable) {
+            loadError = "LoadLib Error: ${t.message}"
+        }
     }
 
     @JvmStatic
