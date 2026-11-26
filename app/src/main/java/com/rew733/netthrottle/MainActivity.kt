@@ -2,6 +2,8 @@ package com.rew733.netthrottle
 
 import android.Manifest
 import android.app.Activity
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ApplicationInfo
@@ -9,10 +11,13 @@ import android.content.pm.PackageManager
 import android.net.VpnService
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.text.Editable
 import android.text.TextWatcher
 import android.view.inputmethod.InputMethodManager
 import android.widget.EditText
+import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
@@ -32,6 +37,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnToggleVpn: MaterialButton
     private lateinit var etSpeedInput: EditText
     private lateinit var btnApplySpeed: MaterialButton
+    private lateinit var tvLiveStats: TextView
+    private lateinit var btnCopyLog: MaterialButton
+    private lateinit var tvDiagnosticLog: TextView
     private lateinit var tabLayout: TabLayout
     private lateinit var etSearch: EditText
     private lateinit var btnSelectAll: MaterialButton
@@ -40,6 +48,19 @@ class MainActivity : AppCompatActivity() {
     private lateinit var adapter: AppAdapter
 
     private var currentSpeedKbps: Int = 100
+    private val uiHandler = Handler(Looper.getMainLooper())
+
+    private val uiStatsUpdater = object : Runnable {
+        override fun run() {
+            val down = ThrottleVpnService.liveDownKbps
+            val up = ThrottleVpnService.liveUpKbps
+            val conns = ThrottleVpnService.liveConnections
+            tvLiveStats.text = "تنزيل: $down KB/s | رفع: $up KB/s | اتصالات: $conns"
+            tvDiagnosticLog.text = ThrottleVpnService.diagnosticStatus
+            updateToggleButton()
+            uiHandler.postDelayed(this, 1000L)
+        }
+    }
 
     private val vpnPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
@@ -63,6 +84,9 @@ class MainActivity : AppCompatActivity() {
         btnToggleVpn = findViewById(R.id.btnToggleVpn)
         etSpeedInput = findViewById(R.id.etSpeedInput)
         btnApplySpeed = findViewById(R.id.btnApplySpeed)
+        tvLiveStats = findViewById(R.id.tvLiveStats)
+        btnCopyLog = findViewById(R.id.btnCopyLog)
+        tvDiagnosticLog = findViewById(R.id.tvDiagnosticLog)
         tabLayout = findViewById(R.id.tabLayout)
         etSearch = findViewById(R.id.etSearch)
         btnSelectAll = findViewById(R.id.btnSelectAll)
@@ -93,7 +117,6 @@ class MainActivity : AppCompatActivity() {
             currentSpeedKbps = parsed
             prefs.edit().putInt("speed_kbps", currentSpeedKbps).apply()
 
-            // إخفاء لوحة المفاتيح بعد التطبيق
             val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
             imm.hideSoftInputFromWindow(etSpeedInput.windowToken, 0)
 
@@ -105,6 +128,20 @@ class MainActivity : AppCompatActivity() {
                 startService(intent)
             }
             Toast.makeText(this, "تم ضبط السرعة على $currentSpeedKbps KB/s", Toast.LENGTH_SHORT).show()
+        }
+
+        btnCopyLog.setOnClickListener {
+            val report = buildString {
+                appendLine("=== تقرير NetThrottle ===")
+                appendLine("السرعة المحددة: $currentSpeedKbps KB/s")
+                appendLine("القياس الحي: ${tvLiveStats.text}")
+                appendLine("السجل: ${ThrottleVpnService.diagnosticStatus}")
+                appendLine("تطبيقات التحديد (${adapter.throttledPackages.size}): ${adapter.throttledPackages.joinToString()}")
+                appendLine("تطبيقات الحظر (${adapter.blockedPackages.size}): ${adapter.blockedPackages.joinToString()}")
+            }
+            val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            clipboard.setPrimaryClip(ClipData.newPlainText("NetThrottle Log", report))
+            Toast.makeText(this, "تم نسخ السجل التشخيصي", Toast.LENGTH_SHORT).show()
         }
 
         btnRefresh.setOnClickListener {
@@ -153,7 +190,6 @@ class MainActivity : AppCompatActivity() {
                 startService(intent)
                 btnToggleVpn.postDelayed({ updateToggleButton() }, 300)
             } else {
-                // قراءة الرقم المكتوب في المربع قبل التشغيل مباشرة
                 val typed = etSpeedInput.text.toString().trim().toIntOrNull()
                 if (typed != null && typed >= 1) {
                     currentSpeedKbps = typed
@@ -170,6 +206,13 @@ class MainActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         updateToggleButton()
+        uiHandler.removeCallbacks(uiStatsUpdater)
+        uiHandler.post(uiStatsUpdater)
+    }
+
+    override fun onPause() {
+        super.onPause()
+        uiHandler.removeCallbacks(uiStatsUpdater)
     }
 
     private fun saveSelections() {
@@ -201,10 +244,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun prepareAndStartVpn() {
-        if (adapter.throttledPackages.isEmpty() && adapter.blockedPackages.isEmpty()) {
-            Toast.makeText(this, "حدد تطبيقاً واحداً على الأقل للتحديد أو الحظر", Toast.LENGTH_SHORT).show()
-            return
-        }
         val prepareIntent = VpnService.prepare(this)
         if (prepareIntent != null) {
             vpnPermissionLauncher.launch(prepareIntent)
