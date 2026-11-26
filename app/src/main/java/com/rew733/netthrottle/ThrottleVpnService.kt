@@ -45,6 +45,9 @@ class ThrottleVpnService : VpnService() {
     private val tcpSessions = ConcurrentHashMap<String, TcpSession>()
     private val udpSockets = ConcurrentHashMap<String, DatagramSocket>()
 
+    @Volatile
+    private var currentSpeedKbps: Int = 150
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_STOP -> {
@@ -53,6 +56,7 @@ class ThrottleVpnService : VpnService() {
             }
             ACTION_UPDATE_SPEED -> {
                 val kbps = intent.getIntExtra(EXTRA_SPEED_KBPS, 150)
+                currentSpeedKbps = kbps
                 val bytesPerSec = kbps * 1024L
                 downloadLimiter.updateRate(bytesPerSec)
                 uploadLimiter.updateRate(bytesPerSec)
@@ -62,6 +66,7 @@ class ThrottleVpnService : VpnService() {
             ACTION_START -> {
                 val packages = intent.getStringArrayListExtra(EXTRA_PACKAGES) ?: arrayListOf()
                 val kbps = intent.getIntExtra(EXTRA_SPEED_KBPS, 150)
+                currentSpeedKbps = kbps
                 val bytesPerSec = kbps * 1024L
                 downloadLimiter.updateRate(bytesPerSec)
                 uploadLimiter.updateRate(bytesPerSec)
@@ -119,7 +124,7 @@ class ThrottleVpnService : VpnService() {
 
         val builder = Builder()
             .setSession("NetThrottle")
-            .setMtu(1500)
+            .setMtu(1400)
             .addAddress("10.0.0.2", 32)
             .addRoute("0.0.0.0", 0)
             .addDnsServer("8.8.8.8")
@@ -204,7 +209,10 @@ class ThrottleVpnService : VpnService() {
 
         executor.execute {
             try {
-                uploadLimiter.consume(payload.size)
+                // لا نؤخر استعلامات DNS (منفذ 53) حتى لا تتأخر الاستجابة وتظهر دائرة التحميل
+                if (dstPort != 53) {
+                    uploadLimiter.consume(payload.size)
+                }
                 var socket = udpSockets[key]
                 if (socket == null || socket.isClosed) {
                     socket = DatagramSocket()
@@ -220,7 +228,9 @@ class ThrottleVpnService : VpnService() {
                             try {
                                 activeSocket.receive(dp)
                                 val data = dp.data.copyOf(dp.length)
-                                downloadLimiter.consume(data.size)
+                                if (dstPort != 53) {
+                                    downloadLimiter.consume(data.size)
+                                }
                                 val respPacket = buildIpv4UdpPacket(dstIp, srcIp, dstPort, srcPort, data)
                                 synchronized(tunOut) {
                                     tunOut.write(respPacket)
@@ -294,6 +304,11 @@ class ThrottleVpnService : VpnService() {
         }
     }
 
+    private fun computeAdaptiveWindow(): Int {
+        // تصغير نافذة TCP لإجبار الخادم على خفض الجودة تلقائياً (ABR) ومنع التقطيع
+        return (currentSpeedKbps * 32).coerceIn(2048, 32768)
+    }
+
     private inner class TcpSession(
         val key: String,
         val clientIp: ByteArray,
@@ -314,10 +329,10 @@ class ThrottleVpnService : VpnService() {
                 val s = Socket()
                 protect(s)
                 s.tcpNoDelay = true
+                s.receiveBufferSize = computeAdaptiveWindow()
                 s.connect(InetSocketAddress(InetAddress.getByAddress(serverIp), serverPort), 10000)
                 socket = s
 
-                // Send SYN-ACK to app
                 val synAck = buildIpv4TcpPacket(
                     serverIp, clientIp, serverPort, clientPort,
                     serverSeq, clientNextSeq, 0x12, ByteArray(0)
@@ -325,9 +340,8 @@ class ThrottleVpnService : VpnService() {
                 serverSeq += 1
                 writeToTun(synAck)
 
-                // Read downstream data from remote server
                 val inStream = s.getInputStream()
-                val buf = ByteArray(1400)
+                val buf = ByteArray(1024)
                 while (isRunning && !closed && !s.isClosed) {
                     val read = inStream.read(buf)
                     if (read == -1) {
@@ -366,7 +380,6 @@ class ThrottleVpnService : VpnService() {
         fun sendToRemote(data: ByteArray, seq: Long) {
             if (closed) return
             if (seq < clientNextSeq) {
-                // Duplicate retransmission, re-ACK
                 val ackPkt = buildIpv4TcpPacket(
                     serverIp, clientIp, serverPort, clientPort,
                     serverSeq, clientNextSeq, 0x10, ByteArray(0)
@@ -447,7 +460,7 @@ class ThrottleVpnService : VpnService() {
         buf.putShort(srcPort.toShort())
         buf.putShort(dstPort.toShort())
         buf.putShort(udpLen.toShort())
-        buf.putShort(0) // Optional UDP checksum in IPv4
+        buf.putShort(0)
         buf.put(payload)
 
         return buf.array()
@@ -467,7 +480,6 @@ class ThrottleVpnService : VpnService() {
         val totalLen = 20 + tcpLen
         val buf = ByteBuffer.allocate(totalLen)
 
-        // IPv4 Header
         buf.put(0x45.toByte())
         buf.put(0x00.toByte())
         buf.putShort(totalLen.toShort())
@@ -482,16 +494,15 @@ class ThrottleVpnService : VpnService() {
         val ipChecksum = computeChecksum(buf.array(), 0, 20)
         buf.putShort(10, ipChecksum)
 
-        // TCP Header
         buf.putShort(srcPort.toShort())
         buf.putShort(dstPort.toShort())
         buf.putInt(seqNum.toInt())
         buf.putInt(ackNum.toInt())
-        buf.put(0x50.toByte()) // Data offset 5 (20 bytes)
+        buf.put(0x50.toByte())
         buf.put(flags.toByte())
-        buf.putShort(65535.toShort()) // Window size
-        buf.putShort(0) // Checksum placeholder
-        buf.putShort(0) // Urgent pointer
+        buf.putShort(computeAdaptiveWindow().toShort())
+        buf.putShort(0)
+        buf.putShort(0)
         buf.put(payload)
 
         val tcpChecksum = computeTcpChecksum(srcIp, dstIp, buf.array(), 20, tcpLen)
