@@ -2,6 +2,7 @@ package com.rew733.netthrottle
 
 import android.Manifest
 import android.app.Activity
+import android.app.AppOpsManager
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
@@ -13,6 +14,8 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.Process
+import android.provider.Settings
 import android.text.Editable
 import android.text.TextWatcher
 import android.view.inputmethod.InputMethodManager
@@ -26,6 +29,7 @@ import androidx.lifecycle.lifecycleScope
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import com.google.android.material.button.MaterialButton
+import com.google.android.material.switchmaterial.SwitchMaterial
 import com.google.android.material.tabs.TabLayout
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -37,6 +41,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnToggleVpn: MaterialButton
     private lateinit var etSpeedInput: EditText
     private lateinit var btnApplySpeed: MaterialButton
+    private lateinit var switchForegroundOnly: SwitchMaterial
     private lateinit var tvLiveStats: TextView
     private lateinit var btnCopyLog: MaterialButton
     private lateinit var tvDiagnosticLog: TextView
@@ -84,6 +89,7 @@ class MainActivity : AppCompatActivity() {
         btnToggleVpn = findViewById(R.id.btnToggleVpn)
         etSpeedInput = findViewById(R.id.etSpeedInput)
         btnApplySpeed = findViewById(R.id.btnApplySpeed)
+        switchForegroundOnly = findViewById(R.id.switchForegroundOnly)
         tvLiveStats = findViewById(R.id.tvLiveStats)
         btnCopyLog = findViewById(R.id.btnCopyLog)
         tvDiagnosticLog = findViewById(R.id.tvDiagnosticLog)
@@ -95,6 +101,24 @@ class MainActivity : AppCompatActivity() {
 
         val prefs = getSharedPreferences("net_throttle_prefs", Context.MODE_PRIVATE)
         currentSpeedKbps = prefs.getInt("speed_kbps", 100).coerceAtLeast(1)
+        switchForegroundOnly.isChecked = prefs.getBoolean("foreground_only_mode", false)
+
+        switchForegroundOnly.setOnCheckedChangeListener { _, isChecked ->
+            if (isChecked && !hasUsageStatsPermission()) {
+                switchForegroundOnly.isChecked = false
+                Toast.makeText(
+                    this,
+                    "فعّل صلاحية الوصول إلى بيانات الاستخدام لتطبيق NetThrottle أولاً",
+                    Toast.LENGTH_LONG
+                ).show()
+                startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS))
+                return@setOnCheckedChangeListener
+            }
+            prefs.edit().putBoolean("foreground_only_mode", isChecked).apply()
+            if (ThrottleVpnService.isRunning) {
+                startThrottleService()
+            }
+        }
 
         adapter = AppAdapter {
             saveSelections()
@@ -134,6 +158,7 @@ class MainActivity : AppCompatActivity() {
             val report = buildString {
                 appendLine("=== تقرير NetThrottle ===")
                 appendLine("السرعة المحددة: $currentSpeedKbps KB/s")
+                appendLine("وضع التطبيق المفتوح فقط: ${switchForegroundOnly.isChecked}")
                 appendLine("القياس الحي: ${tvLiveStats.text}")
                 appendLine("السجل: ${ThrottleVpnService.diagnosticStatus}")
                 appendLine("تطبيقات التحديد (${adapter.throttledPackages.size}): ${adapter.throttledPackages.joinToString()}")
@@ -190,6 +215,15 @@ class MainActivity : AppCompatActivity() {
                 startService(intent)
                 btnToggleVpn.postDelayed({ updateToggleButton() }, 300)
             } else {
+                if (switchForegroundOnly.isChecked && !hasUsageStatsPermission()) {
+                    Toast.makeText(
+                        this,
+                        "فعّل صلاحية الوصول إلى بيانات الاستخدام أولاً",
+                        Toast.LENGTH_LONG
+                    ).show()
+                    startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS))
+                    return@setOnClickListener
+                }
                 val typed = etSpeedInput.text.toString().trim().toIntOrNull()
                 if (typed != null && typed >= 1) {
                     currentSpeedKbps = typed
@@ -213,6 +247,25 @@ class MainActivity : AppCompatActivity() {
     override fun onPause() {
         super.onPause()
         uiHandler.removeCallbacks(uiStatsUpdater)
+    }
+
+    private fun hasUsageStatsPermission(): Boolean {
+        val appOps = getSystemService(Context.APP_OPS_SERVICE) as AppOpsManager
+        val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            appOps.unsafeCheckOpNoThrow(
+                AppOpsManager.OPSTR_GET_USAGE_STATS,
+                Process.myUid(),
+                packageName
+            )
+        } else {
+            @Suppress("DEPRECATION")
+            appOps.checkOpNoThrow(
+                AppOpsManager.OPSTR_GET_USAGE_STATS,
+                Process.myUid(),
+                packageName
+            )
+        }
+        return mode == AppOpsManager.MODE_ALLOWED
     }
 
     private fun saveSelections() {
@@ -258,6 +311,7 @@ class MainActivity : AppCompatActivity() {
             putStringArrayListExtra(ThrottleVpnService.EXTRA_PACKAGES, ArrayList(adapter.throttledPackages))
             putStringArrayListExtra(ThrottleVpnService.EXTRA_BLOCKED_PACKAGES, ArrayList(adapter.blockedPackages))
             putExtra(ThrottleVpnService.EXTRA_SPEED_KBPS, currentSpeedKbps)
+            putExtra(ThrottleVpnService.EXTRA_FOREGROUND_ONLY_MODE, switchForegroundOnly.isChecked)
         }
         ContextCompat.startForegroundService(this, intent)
         btnToggleVpn.postDelayed({ updateToggleButton() }, 400)
