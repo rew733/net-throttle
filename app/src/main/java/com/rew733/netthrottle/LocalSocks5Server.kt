@@ -1,10 +1,6 @@
 package com.rew733.netthrottle
 
-import android.content.Context
-import android.net.ConnectivityManager
 import android.net.VpnService
-import android.os.Build
-import android.system.OsConstants
 import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.io.InputStream
@@ -25,14 +21,9 @@ class LocalSocks5Server(
 ) {
     private var serverSocket: ServerSocket? = null
     private val executor = Executors.newCachedThreadPool()
-    private val connectivityManager =
-        vpnService.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
 
     @Volatile
     private var running = false
-
-    @Volatile
-    var blockedUids: Set<Int> = emptySet()
 
     val port: Int = 10808
 
@@ -49,6 +40,8 @@ class LocalSocks5Server(
                 try {
                     val client = serverSocket?.accept() ?: break
                     client.tcpNoDelay = true
+                    client.receiveBufferSize = 1024
+                    client.sendBufferSize = 1024
                     executor.execute { handleClient(client) }
                 } catch (_: Exception) {
                     if (!running) break
@@ -64,28 +57,6 @@ class LocalSocks5Server(
         } catch (_: Exception) {
         }
         serverSocket = null
-    }
-
-    private fun isConnectionBlocked(
-        protocol: Int,
-        srcPort: Int,
-        dstHost: String,
-        dstPort: Int
-    ): Boolean {
-        val blocked = blockedUids
-        if (blocked.isEmpty()) return false
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            try {
-                val localAddr = InetSocketAddress(InetAddress.getByName("10.0.0.2"), srcPort)
-                val remoteAddr = InetSocketAddress(InetAddress.getByName(dstHost), dstPort)
-                val uid = connectivityManager.getConnectionOwnerUid(protocol, localAddr, remoteAddr)
-                if (uid > 0 && blocked.contains(uid)) {
-                    return true
-                }
-            } catch (_: Exception) {
-            }
-        }
-        return false
     }
 
     private fun handleClient(client: Socket) {
@@ -158,21 +129,12 @@ class LocalSocks5Server(
         host: String,
         port: Int
     ) {
-        if (isConnectionBlocked(OsConstants.IPPROTO_TCP, client.port, host, port)) {
-            try {
-                clientOut.write(byteArrayOf(0x05, 0x02, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
-                clientOut.flush()
-                client.close()
-            } catch (_: Exception) {
-            }
-            return
-        }
-
         val remote = Socket()
         try {
             vpnService.protect(remote)
             remote.tcpNoDelay = true
-            remote.receiveBufferSize = 2048
+            remote.receiveBufferSize = 1024
+            remote.sendBufferSize = 1024
             remote.connect(InetSocketAddress(host, port), 10000)
 
             clientOut.write(byteArrayOf(0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
@@ -182,7 +144,7 @@ class LocalSocks5Server(
             val remoteOut = remote.getOutputStream()
 
             val upFuture = executor.submit {
-                val buf = ByteArray(1024)
+                val buf = ByteArray(512)
                 try {
                     while (running && !client.isClosed && !remote.isClosed) {
                         val read = clientIn.read(buf)
@@ -256,7 +218,7 @@ class LocalSocks5Server(
         clientOut.flush()
 
         executor.execute {
-            val buf = ByteArray(4096)
+            val buf = ByteArray(2048)
             val packet = DatagramPacket(buf, buf.size)
             var clientAppAddr: InetSocketAddress? = null
 
@@ -290,17 +252,6 @@ class LocalSocks5Server(
 
                         if (destPort == 443 || destPort == 80) continue
 
-                        val destHostStr = destAddr.hostAddress ?: ""
-                        if (destHostStr.isNotEmpty() && isConnectionBlocked(
-                                OsConstants.IPPROTO_UDP,
-                                packet.port,
-                                destHostStr,
-                                destPort
-                            )
-                        ) {
-                            continue
-                        }
-
                         val payload = buf.copyOfRange(offset, len)
                         if (destPort != 53) {
                             uploadLimiter.consume(payload.size)
@@ -312,7 +263,7 @@ class LocalSocks5Server(
                         executor.execute {
                             try {
                                 outSock.send(DatagramPacket(payload, payload.size, destAddr, destPort))
-                                val rBuf = ByteArray(4096)
+                                val rBuf = ByteArray(2048)
                                 val rPkt = DatagramPacket(rBuf, rBuf.size)
                                 outSock.receive(rPkt)
                                 val rData = rPkt.data.copyOf(rPkt.length)
