@@ -1,10 +1,6 @@
 package com.rew733.netthrottle
 
-import android.content.Context
-import android.net.ConnectivityManager
 import android.net.VpnService
-import android.os.Build
-import android.system.OsConstants
 import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.io.InputStream
@@ -30,14 +26,12 @@ class LocalSocks5Server(
     private var serverSocket: ServerSocket? = null
     private val executor = Executors.newCachedThreadPool()
     private val activeSockets = ConcurrentHashMap.newKeySet<Socket>()
-    private val connectivityManager =
-        vpnService.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
 
     @Volatile
     var foregroundOnlyEnabled: Boolean = false
 
     @Volatile
-    var allowedForegroundUid: Int = -1
+    var hasActiveForegroundApp: Boolean = false
 
     val totalDownloadBytes = AtomicLong(0L)
     val totalUploadBytes = AtomicLong(0L)
@@ -106,29 +100,6 @@ class LocalSocks5Server(
         serverSocket = null
     }
 
-    private fun isClientAllowed(client: Socket): Boolean {
-        if (!foregroundOnlyEnabled) return true
-        val targetUid = allowedForegroundUid
-        if (targetUid <= 0) return false
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            try {
-                val localAddr = InetSocketAddress(client.inetAddress, client.port)
-                val remoteAddr = InetSocketAddress(client.localAddress, client.localPort)
-                val ownerUid = connectivityManager.getConnectionOwnerUid(
-                    OsConstants.IPPROTO_TCP,
-                    localAddr,
-                    remoteAddr
-                )
-                if (ownerUid > 0 && ownerUid != targetUid) {
-                    return false
-                }
-            } catch (_: Exception) {
-            }
-        }
-        return true
-    }
-
     private fun handleClient(client: Socket) {
         activeConnections.incrementAndGet()
         try {
@@ -176,8 +147,8 @@ class LocalSocks5Server(
             }
             val destPort = input.readUnsignedShort()
 
-            // حظر فوري لأي تطبيق في الخلفية إذا كان وضع "التطبيق المفتوح فقط" مفعلاً
-            if (!isClientAllowed(client)) {
+            // إذا كان وضع التطبيق المفتوح مفعلاً ولا يوجد تطبيق مستخدم مفتوح حالياً (الشاشة مغلقة أو في الرئيسية)
+            if (foregroundOnlyEnabled && !hasActiveForegroundApp) {
                 blockedCount.incrementAndGet()
                 output.write(byteArrayOf(0x05, 0x02, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
                 output.flush()
@@ -335,7 +306,7 @@ class LocalSocks5Server(
                     val len = packet.length
                     if (len < 10) continue
 
-                    if (foregroundOnlyEnabled && allowedForegroundUid <= 0) {
+                    if (foregroundOnlyEnabled && !hasActiveForegroundApp) {
                         blockedCount.incrementAndGet()
                         continue
                     }
