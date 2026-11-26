@@ -1,364 +1,229 @@
 package com.rew733.netthrottle
 
-import android.content.Context
-import android.net.ConnectivityManager
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.content.pm.ServiceInfo
 import android.net.VpnService
 import android.os.Build
-import android.system.OsConstants
-import java.io.DataInputStream
-import java.io.DataOutputStream
-import java.io.InputStream
-import java.io.OutputStream
-import java.net.DatagramPacket
-import java.net.DatagramSocket
-import java.net.InetAddress
-import java.net.InetSocketAddress
-import java.net.ServerSocket
-import java.net.Socket
-import java.nio.ByteBuffer
-import java.util.concurrent.Executors
+import android.os.ParcelFileDescriptor
+import androidx.core.app.NotificationCompat
+import hev.htproxy.TProxyService
+import java.io.File
 
-class LocalSocks5Server(
-    private val vpnService: VpnService,
-    private val downloadLimiter: TokenBucketLimiter,
-    private val uploadLimiter: TokenBucketLimiter
-) {
-    private var serverSocket: ServerSocket? = null
-    private val executor = Executors.newCachedThreadPool()
-    private val connectivityManager =
-        vpnService.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+class ThrottleVpnService : VpnService() {
 
-    @Volatile
-    private var running = false
+    companion object {
+        const val ACTION_START = "com.rew733.netthrottle.START"
+        const val ACTION_STOP = "com.rew733.netthrottle.STOP"
+        const val ACTION_UPDATE_SPEED = "com.rew733.netthrottle.UPDATE_SPEED"
+        const val EXTRA_PACKAGES = "extra_packages"
+        const val EXTRA_BLOCKED_PACKAGES = "extra_blocked_packages"
+        const val EXTRA_SPEED_KBPS = "extra_speed_kbps"
 
-    @Volatile
-    var blockedUids: Set<Int> = emptySet()
+        @Volatile
+        var isRunning = false
+            private set
 
-    val port: Int = 10808
+        private const val CHANNEL_ID = "net_throttle_vpn"
+        private const val NOTIF_ID = 101
+    }
 
-    fun start() {
-        if (running) return
-        running = true
-        serverSocket = ServerSocket().apply {
-            reuseAddress = true
-            bind(InetSocketAddress("127.0.0.1", port))
-        }
+    private var vpnInterface: ParcelFileDescriptor? = null
+    private val downloadLimiter = TokenBucketLimiter(100 * 1024L)
+    private val uploadLimiter = TokenBucketLimiter(100 * 1024L)
+    private var socksServer: LocalSocks5Server? = null
 
-        executor.execute {
-            while (running) {
-                try {
-                    val client = serverSocket?.accept() ?: break
-                    client.tcpNoDelay = true
-                    executor.execute { handleClient(client) }
-                } catch (_: Exception) {
-                    if (!running) break
-                }
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        when (intent?.action) {
+            ACTION_STOP -> {
+                stopVpn()
+                return START_NOT_STICKY
+            }
+            ACTION_UPDATE_SPEED -> {
+                val kbps = intent.getIntExtra(EXTRA_SPEED_KBPS, 100)
+                val bytesPerSec = kbps * 1024L
+                downloadLimiter.updateRate(bytesPerSec)
+                uploadLimiter.updateRate(bytesPerSec)
+                updateNotification("الحد: $kbps KB/s")
+                return START_STICKY
+            }
+            ACTION_START -> {
+                val throttled = intent.getStringArrayListExtra(EXTRA_PACKAGES) ?: arrayListOf()
+                val blocked = intent.getStringArrayListExtra(EXTRA_BLOCKED_PACKAGES) ?: arrayListOf()
+                val kbps = intent.getIntExtra(EXTRA_SPEED_KBPS, 100)
+                val bytesPerSec = kbps * 1024L
+                downloadLimiter.updateRate(bytesPerSec)
+                uploadLimiter.updateRate(bytesPerSec)
+                startForegroundServiceWithNotification("جاري التشغيل...")
+                startVpn(throttled, blocked, kbps)
             }
         }
+        return START_STICKY
     }
 
-    fun stop() {
-        running = false
-        try {
-            serverSocket?.close()
-        } catch (_: Exception) {
+    private fun startForegroundServiceWithNotification(text: String) {
+        val manager = getSystemService(NotificationManager::class.java)
+        val channel = NotificationChannel(
+            CHANNEL_ID,
+            "NetThrottle VPN",
+            NotificationManager.IMPORTANCE_LOW
+        )
+        manager.createNotificationChannel(channel)
+
+        val notification = buildNotification(text)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            startForeground(NOTIF_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+        } else {
+            startForeground(NOTIF_ID, notification)
         }
-        serverSocket = null
     }
 
-    private fun isConnectionBlocked(
-        protocol: Int,
-        srcPort: Int,
-        dstHost: String,
-        dstPort: Int
-    ): Boolean {
-        val blocked = blockedUids
-        if (blocked.isEmpty()) return false
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+    private fun updateNotification(text: String) {
+        val manager = getSystemService(NotificationManager::class.java)
+        manager.notify(NOTIF_ID, buildNotification(text))
+    }
+
+    private fun buildNotification(text: String): Notification {
+        val openIntent = PendingIntent.getActivity(
+            this, 0, Intent(this, MainActivity::class.java),
+            PendingIntent.FLAG_IMMUTABLE
+        )
+        val stopIntent = PendingIntent.getService(
+            this, 1, Intent(this, ThrottleVpnService::class.java).apply { action = ACTION_STOP },
+            PendingIntent.FLAG_IMMUTABLE
+        )
+        return NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("NetThrottle نشط")
+            .setContentText(text)
+            .setSmallIcon(android.R.drawable.stat_sys_download)
+            .setContentIntent(openIntent)
+            .addAction(android.R.drawable.ic_media_pause, "إيقاف", stopIntent)
+            .setOngoing(true)
+            .build()
+    }
+
+    private fun resolveBlockedUids(blockedPackages: List<String>): Set<Int> {
+        val uids = mutableSetOf<Int>()
+        for (pkg in blockedPackages) {
             try {
-                val localAddr = InetSocketAddress(InetAddress.getByName("10.0.0.2"), srcPort)
-                val remoteAddr = InetSocketAddress(InetAddress.getByName(dstHost), dstPort)
-                val uid = connectivityManager.getConnectionOwnerUid(protocol, localAddr, remoteAddr)
-                if (uid > 0 && blocked.contains(uid)) {
-                    return true
+                val appInfo = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    packageManager.getApplicationInfo(pkg, PackageManager.ApplicationInfoFlags.of(0))
+                } else {
+                    @Suppress("DEPRECATION")
+                    packageManager.getApplicationInfo(pkg, 0)
+                }
+                if (appInfo.uid > 0) {
+                    uids.add(appInfo.uid)
                 }
             } catch (_: Exception) {
             }
         }
-        return false
+        return uids
     }
 
-    private fun handleClient(client: Socket) {
-        try {
-            val input = DataInputStream(client.getInputStream())
-            val output = DataOutputStream(client.getOutputStream())
+    private fun startVpn(
+        throttledPackages: List<String>,
+        blockedPackages: List<String>,
+        kbps: Int
+    ) {
+        stopVpnInternal()
 
-            val version = input.readUnsignedByte()
-            if (version != 0x05) {
-                client.close()
+        try {
+            val server = LocalSocks5Server(this, downloadLimiter, uploadLimiter)
+            server.blockedUids = resolveBlockedUids(blockedPackages)
+            server.start()
+            socksServer = server
+
+            val builder = Builder()
+                .setSession("NetThrottle")
+                .setMtu(1500)
+                .addAddress("10.0.0.2", 32)
+                .addRoute("0.0.0.0", 0)
+                .addDnsServer("8.8.8.8")
+                .addDnsServer("1.1.1.1")
+
+            val allManagedPackages = (throttledPackages + blockedPackages).distinct()
+            var addedCount = 0
+            for (pkg in allManagedPackages) {
+                if (pkg == packageName) continue
+                try {
+                    builder.addAllowedApplication(pkg)
+                    addedCount++
+                } catch (_: Exception) {
+                }
+            }
+
+            if (addedCount == 0) {
+                updateNotification("لم يتم تحديد أي تطبيق")
                 return
             }
-            val nMethods = input.readUnsignedByte()
-            val methods = ByteArray(nMethods)
-            input.readFully(methods)
 
-            output.write(byteArrayOf(0x05, 0x00))
-            output.flush()
-
-            input.readUnsignedByte() // VER
-            val cmd = input.readUnsignedByte()
-            input.readUnsignedByte() // RSV
-            val atyp = input.readUnsignedByte()
-
-            val destHost: String = when (atyp) {
-                0x01 -> {
-                    val addr = ByteArray(4)
-                    input.readFully(addr)
-                    InetAddress.getByAddress(addr).hostAddress ?: ""
-                }
-                0x03 -> {
-                    val len = input.readUnsignedByte()
-                    val domain = ByteArray(len)
-                    input.readFully(domain)
-                    String(domain, Charsets.UTF_8)
-                }
-                0x04 -> {
-                    val addr = ByteArray(16)
-                    input.readFully(addr)
-                    InetAddress.getByAddress(addr).hostAddress ?: ""
-                }
-                else -> {
-                    client.close()
-                    return
-                }
+            val pfd = builder.establish()
+            if (pfd == null) {
+                updateNotification("فشل إنشاء واجهة VPN")
+                return
             }
-            val destPort = input.readUnsignedShort()
+            vpnInterface = pfd
 
-            when (cmd) {
-                0x01 -> handleTcpConnect(client, input, output, destHost, destPort)
-                0x03 -> handleUdpAssociate(client, input, output)
-                else -> {
-                    output.write(byteArrayOf(0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
-                    output.flush()
-                    client.close()
-                }
-            }
-        } catch (_: Exception) {
-            try {
-                client.close()
-            } catch (_: Exception) {
-            }
+            val configFile = File(cacheDir, "tproxy.conf")
+            configFile.writeText(
+                """
+                tunnel:
+                  name: tun0
+                  mtu: 1500
+                  multi-queue: false
+                  ipv4: 10.0.0.2
+                socks5:
+                  port: ${server.port}
+                  address: 127.0.0.1
+                  udp: 'udp'
+                misc:
+                  task-stack-size: 81920
+                  tcp-buffer-size: 4096
+                  connect-timeout: 5000
+                  read-write-timeout: 60000
+                  log-level: warn
+                """.trimIndent()
+            )
+
+            TProxyService.TProxyStartService(configFile.absolutePath, pfd.fd)
+            isRunning = true
+            updateNotification("الحد: $kbps KB/s | محظور: ${blockedPackages.size} تطبيق")
+        } catch (t: Throwable) {
+            isRunning = false
+            updateNotification("خطأ: ${t.javaClass.simpleName}: ${t.message}")
         }
     }
 
-    private fun handleTcpConnect(
-        client: Socket,
-        clientIn: InputStream,
-        clientOut: OutputStream,
-        host: String,
-        port: Int
-    ) {
-        // التحقق مما إذا كان التطبيق محظوراً
-        if (isConnectionBlocked(OsConstants.IPPROTO_TCP, client.port, host, port)) {
+    private fun stopVpnInternal() {
+        if (isRunning) {
             try {
-                clientOut.write(byteArrayOf(0x05, 0x02, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
-                clientOut.flush()
-                client.close()
-            } catch (_: Exception) {
+                TProxyService.TProxyStopService()
+            } catch (_: Throwable) {
             }
-            return
         }
-
-        val remote = Socket()
+        isRunning = false
+        socksServer?.stop()
+        socksServer = null
         try {
-            vpnService.protect(remote)
-            remote.tcpNoDelay = true
-            remote.receiveBufferSize = 2048
-            remote.connect(InetSocketAddress(host, port), 10000)
-
-            clientOut.write(byteArrayOf(0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
-            clientOut.flush()
-
-            val remoteIn = remote.getInputStream()
-            val remoteOut = remote.getOutputStream()
-
-            val upFuture = executor.submit {
-                val buf = ByteArray(1024)
-                try {
-                    while (running && !client.isClosed && !remote.isClosed) {
-                        val read = clientIn.read(buf)
-                        if (read == -1) break
-                        if (read > 0) {
-                            uploadLimiter.consume(read)
-                            remoteOut.write(buf, 0, read)
-                            remoteOut.flush()
-                        }
-                    }
-                } catch (_: Exception) {
-                } finally {
-                    try {
-                        remote.shutdownOutput()
-                    } catch (_: Exception) {
-                    }
-                }
-            }
-
-            val buf = ByteArray(512)
-            try {
-                while (running && !client.isClosed && !remote.isClosed) {
-                    val read = remoteIn.read(buf)
-                    if (read == -1) break
-                    if (read > 0) {
-                        downloadLimiter.consume(read)
-                        clientOut.write(buf, 0, read)
-                        clientOut.flush()
-                    }
-                }
-            } catch (_: Exception) {
-            } finally {
-                upFuture.cancel(true)
-            }
-        } catch (_: Exception) {
-            try {
-                clientOut.write(byteArrayOf(0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
-                clientOut.flush()
-            } catch (_: Exception) {
-            }
-        } finally {
-            try {
-                remote.close()
-            } catch (_: Exception) {
-            }
-            try {
-                client.close()
-            } catch (_: Exception) {
-            }
+            vpnInterface?.close()
+        } catch (_: Throwable) {
         }
+        vpnInterface = null
     }
 
-    private fun handleUdpAssociate(
-        client: Socket,
-        clientIn: InputStream,
-        clientOut: OutputStream
-    ) {
-        val udpRelay = DatagramSocket(0, InetAddress.getByName("127.0.0.1"))
-        val relayPort = udpRelay.localPort
+    private fun stopVpn() {
+        stopVpnInternal()
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
+    }
 
-        val reply = ByteBuffer.allocate(10).apply {
-            put(0x05.toByte())
-            put(0x00.toByte())
-            put(0x00.toByte())
-            put(0x01.toByte())
-            put(byteArrayOf(127, 0, 0, 1))
-            putShort(relayPort.toShort())
-        }.array()
-
-        clientOut.write(reply)
-        clientOut.flush()
-
-        executor.execute {
-            val buf = ByteArray(4096)
-            val packet = DatagramPacket(buf, buf.size)
-            var clientAppAddr: InetSocketAddress? = null
-
-            try {
-                while (running && !client.isClosed && !udpRelay.isClosed) {
-                    udpRelay.receive(packet)
-                    val len = packet.length
-                    if (len < 10) continue
-
-                    if (packet.address.isLoopbackAddress && (clientAppAddr == null || packet.port == clientAppAddr.port)) {
-                        clientAppAddr = InetSocketAddress(packet.address, packet.port)
-                        val atyp = buf[3].toInt() and 0xFF
-                        var offset = 4
-                        val destAddr: InetAddress = when (atyp) {
-                            0x01 -> {
-                                val ip = buf.copyOfRange(offset, offset + 4)
-                                offset += 4
-                                InetAddress.getByAddress(ip)
-                            }
-                            0x03 -> {
-                                val dLen = buf[offset].toInt() and 0xFF
-                                offset += 1
-                                val host = String(buf, offset, dLen, Charsets.UTF_8)
-                                offset += dLen
-                                InetAddress.getByName(host)
-                            }
-                            else -> continue
-                        }
-                        val destPort = ((buf[offset].toInt() and 0xFF) shl 8) or (buf[offset + 1].toInt() and 0xFF)
-                        offset += 2
-
-                        // حظر QUIC (UDP 443) لتحويل الفيديو إلى TCP المنضبط
-                        if (destPort == 443 || destPort == 80) continue
-
-                        // حظر استعلامات UDP/DNS للتطبيقات المحظورة
-                        val destHostStr = destAddr.hostAddress ?: ""
-                        if (destHostStr.isNotEmpty() && isConnectionBlocked(
-                                OsConstants.IPPROTO_UDP,
-                                packet.port,
-                                destHostStr,
-                                destPort
-                            )
-                        ) {
-                            continue
-                        }
-
-                        val payload = buf.copyOfRange(offset, len)
-                        if (destPort != 53) {
-                            uploadLimiter.consume(payload.size)
-                        }
-
-                        val outSock = DatagramSocket()
-                        vpnService.protect(outSock)
-                        outSock.soTimeout = 5000
-                        executor.execute {
-                            try {
-                                outSock.send(DatagramPacket(payload, payload.size, destAddr, destPort))
-                                val rBuf = ByteArray(4096)
-                                val rPkt = DatagramPacket(rBuf, rBuf.size)
-                                outSock.receive(rPkt)
-                                val rData = rPkt.data.copyOf(rPkt.length)
-                                if (destPort != 53) {
-                                    downloadLimiter.consume(rData.size)
-                                }
-
-                                val srcIpBytes = destAddr.address
-                                val header = ByteBuffer.allocate(6 + srcIpBytes.size + rData.size).apply {
-                                    putShort(0)
-                                    put(0.toByte())
-                                    put(if (srcIpBytes.size == 4) 0x01.toByte() else 0x04.toByte())
-                                    put(srcIpBytes)
-                                    putShort(destPort.toShort())
-                                    put(rData)
-                                }.array()
-
-                                clientAppAddr?.let { target ->
-                                    udpRelay.send(DatagramPacket(header, header.size, target))
-                                }
-                            } catch (_: Exception) {
-                            } finally {
-                                outSock.close()
-                            }
-                        }
-                    }
-                }
-            } catch (_: Exception) {
-            } finally {
-                udpRelay.close()
-            }
-        }
-
-        try {
-            while (running && clientIn.read() != -1) {
-            }
-        } catch (_: Exception) {
-        } finally {
-            udpRelay.close()
-            try {
-                client.close()
-            } catch (_: Exception) {
-            }
-        }
+    override fun onDestroy() {
+        stopVpnInternal()
+        super.onDestroy()
     }
 }
