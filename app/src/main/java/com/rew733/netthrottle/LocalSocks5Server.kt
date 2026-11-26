@@ -14,6 +14,8 @@ import java.net.Socket
 import java.nio.ByteBuffer
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
+import java.util.concurrent.Semaphore
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
@@ -25,6 +27,9 @@ class LocalSocks5Server(
     private var serverSocket: ServerSocket? = null
     private val executor = Executors.newCachedThreadPool()
     private val activeSockets = ConcurrentHashMap.newKeySet<Socket>()
+
+    // بوابة تسمح بـ 8 اتصالات متزامنة فقط لمنع انفجار مصافحات TLS في عداد النظام
+    private val connectionGate = Semaphore(8, true)
 
     val totalDownloadBytes = AtomicLong(0L)
     val totalUploadBytes = AtomicLong(0L)
@@ -170,9 +175,29 @@ class LocalSocks5Server(
         host: String,
         port: Int
     ) {
+        // انتظار دور في البوابة قبل فتح أي اتصال خارجي على الإنترنت
+        val acquired = try {
+            connectionGate.tryAcquire(15, TimeUnit.SECONDS)
+        } catch (_: InterruptedException) {
+            false
+        }
+
+        if (!acquired || !running || client.isClosed) {
+            try {
+                clientOut.write(byteArrayOf(0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
+                clientOut.flush()
+                client.close()
+            } catch (_: Exception) {
+            }
+            return
+        }
+
         val remote = Socket()
         activeSockets.add(remote)
         try {
+            // خصم تكلفة مصافحة TLS و SYN/ACK المسبقة (حوالي 3.5 KB) قبل فتح المقبس
+            downloadLimiter.consume(3500)
+
             vpnService.protect(remote)
             remote.tcpNoDelay = true
             remote.receiveBufferSize = 1024
@@ -234,6 +259,7 @@ class LocalSocks5Server(
             } catch (_: Exception) {
             }
         } finally {
+            connectionGate.release()
             activeSockets.remove(remote)
             try {
                 remote.close()
