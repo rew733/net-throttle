@@ -12,6 +12,7 @@ import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.nio.ByteBuffer
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 
 class LocalSocks5Server(
@@ -21,6 +22,7 @@ class LocalSocks5Server(
 ) {
     private var serverSocket: ServerSocket? = null
     private val executor = Executors.newCachedThreadPool()
+    private val activeSockets = ConcurrentHashMap.newKeySet<Socket>()
 
     @Volatile
     private var running = false
@@ -42,6 +44,7 @@ class LocalSocks5Server(
                     client.tcpNoDelay = true
                     client.receiveBufferSize = 1024
                     client.sendBufferSize = 1024
+                    activeSockets.add(client)
                     executor.execute { handleClient(client) }
                 } catch (_: Exception) {
                     if (!running) break
@@ -50,8 +53,21 @@ class LocalSocks5Server(
         }
     }
 
+    fun refresh() {
+        val iterator = activeSockets.iterator()
+        while (iterator.hasNext()) {
+            val sock = iterator.next()
+            try {
+                sock.close()
+            } catch (_: Exception) {
+            }
+            iterator.remove()
+        }
+    }
+
     fun stop() {
         running = false
+        refresh()
         try {
             serverSocket?.close()
         } catch (_: Exception) {
@@ -119,6 +135,8 @@ class LocalSocks5Server(
                 client.close()
             } catch (_: Exception) {
             }
+        } finally {
+            activeSockets.remove(client)
         }
     }
 
@@ -130,6 +148,7 @@ class LocalSocks5Server(
         port: Int
     ) {
         val remote = Socket()
+        activeSockets.add(remote)
         try {
             vpnService.protect(remote)
             remote.tcpNoDelay = true
@@ -186,10 +205,12 @@ class LocalSocks5Server(
             } catch (_: Exception) {
             }
         } finally {
+            activeSockets.remove(remote)
             try {
                 remote.close()
             } catch (_: Exception) {
             }
+            activeSockets.remove(client)
             try {
                 client.close()
             } catch (_: Exception) {
@@ -303,6 +324,7 @@ class LocalSocks5Server(
         } catch (_: Exception) {
         } finally {
             udpRelay.close()
+            activeSockets.remove(client)
             try {
                 client.close()
             } catch (_: Exception) {
