@@ -47,7 +47,7 @@ class ThrottleVpnService : VpnService() {
                 val bytesPerSec = kbps * 1024L
                 downloadLimiter.updateRate(bytesPerSec)
                 uploadLimiter.updateRate(bytesPerSec)
-                updateNotification(kbps)
+                updateNotification("الحد الأقصى الحالي: $kbps KB/s")
                 return START_STICKY
             }
             ACTION_START -> {
@@ -56,14 +56,14 @@ class ThrottleVpnService : VpnService() {
                 val bytesPerSec = kbps * 1024L
                 downloadLimiter.updateRate(bytesPerSec)
                 uploadLimiter.updateRate(bytesPerSec)
-                startForegroundServiceWithNotification(kbps)
-                startVpn(packages)
+                startForegroundServiceWithNotification("جاري التشغيل ($kbps KB/s)...")
+                startVpn(packages, kbps)
             }
         }
         return START_STICKY
     }
 
-    private fun startForegroundServiceWithNotification(kbps: Int) {
+    private fun startForegroundServiceWithNotification(text: String) {
         val manager = getSystemService(NotificationManager::class.java)
         val channel = NotificationChannel(
             CHANNEL_ID,
@@ -72,7 +72,7 @@ class ThrottleVpnService : VpnService() {
         )
         manager.createNotificationChannel(channel)
 
-        val notification = buildNotification(kbps)
+        val notification = buildNotification(text)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             startForeground(NOTIF_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
         } else {
@@ -80,13 +80,12 @@ class ThrottleVpnService : VpnService() {
         }
     }
 
-    private fun updateNotification(kbps: Int) {
-        if (!isRunning) return
+    private fun updateNotification(text: String) {
         val manager = getSystemService(NotificationManager::class.java)
-        manager.notify(NOTIF_ID, buildNotification(kbps))
+        manager.notify(NOTIF_ID, buildNotification(text))
     }
 
-    private fun buildNotification(kbps: Int): Notification {
+    private fun buildNotification(text: String): Notification {
         val openIntent = PendingIntent.getActivity(
             this, 0, Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_IMMUTABLE
@@ -96,8 +95,9 @@ class ThrottleVpnService : VpnService() {
             PendingIntent.FLAG_IMMUTABLE
         )
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("تحديد السرعة نشط")
-            .setContentText("الحد الأقصى الحالي: $kbps KB/s")
+            .setContentTitle("NetThrottle VPN")
+            .setContentText(text)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(text))
             .setSmallIcon(android.R.drawable.stat_sys_download)
             .setContentIntent(openIntent)
             .addAction(android.R.drawable.ic_media_pause, "إيقاف", stopIntent)
@@ -105,68 +105,83 @@ class ThrottleVpnService : VpnService() {
             .build()
     }
 
-    private fun startVpn(targetPackages: List<String>) {
+    private fun startVpn(targetPackages: List<String>, kbps: Int) {
         stopVpnInternal()
 
-        val server = LocalSocks5Server(this, downloadLimiter, uploadLimiter)
-        server.start()
-        socksServer = server
-
-        val builder = Builder()
-            .setSession("NetThrottle")
-            .setMtu(1500)
-            .addAddress("10.0.0.2", 32)
-            .addRoute("0.0.0.0", 0)
-            .addDnsServer("8.8.8.8")
-            .addDnsServer("1.1.1.1")
-
-        var addedCount = 0
-        for (pkg in targetPackages) {
-            if (pkg == packageName) continue
-            try {
-                builder.addAllowedApplication(pkg)
-                addedCount++
-            } catch (_: Exception) {
-            }
-        }
-
-        if (addedCount == 0) {
-            stopVpn()
+        if (TProxyService.loadError != null) {
+            updateNotification("خطأ مكتبة: ${TProxyService.loadError}")
             return
         }
 
-        val pfd = builder.establish() ?: run {
-            stopVpn()
-            return
-        }
-        vpnInterface = pfd
+        try {
+            val server = LocalSocks5Server(this, downloadLimiter, uploadLimiter)
+            server.start()
+            socksServer = server
 
-        val configFile = File(cacheDir, "tproxy.conf")
-        configFile.writeText(
-            """
-            misc:
-              task-stack-size: 81920
-            tunnel:
-              mtu: 1500
-            socks5:
-              port: ${server.port}
-              address: 127.0.0.1
-              udp: 'udp'
-            """.trimIndent()
-        )
+            val builder = Builder()
+                .setSession("NetThrottle")
+                .setMtu(1500)
+                .addAddress("10.0.0.2", 32)
+                .addRoute("0.0.0.0", 0)
+                .addDnsServer("8.8.8.8")
+                .addDnsServer("1.1.1.1")
 
-        isRunning = true
-        val tunFd = pfd.fd
-        val configPath = configFile.absolutePath
-
-        tunnelThread = Thread {
-            try {
-                TProxyService.TProxyStartService(configPath, tunFd)
-            } catch (_: Exception) {
+            var addedCount = 0
+            for (pkg in targetPackages) {
+                if (pkg == packageName) continue
+                try {
+                    builder.addAllowedApplication(pkg)
+                    addedCount++
+                } catch (_: Exception) {
+                }
             }
-        }.apply {
-            name = "HevSocks5TunnelThread"
-            start()
+
+            if (addedCount == 0) {
+                updateNotification("لم يتم تحديد أي تطبيق")
+                return
+            }
+
+            val pfd = builder.establish()
+            if (pfd == null) {
+                updateNotification("فشل إنشاء واجهة VPN")
+                return
+            }
+            vpnInterface = pfd
+
+            val configFile = File(cacheDir, "tproxy.conf")
+            configFile.writeText(
+                """
+                misc:
+                  task-stack-size: 81920
+                tunnel:
+                  mtu: 1500
+                socks5:
+                  port: ${server.port}
+                  address: 127.0.0.1
+                  udp: 'udp'
+                """.trimIndent()
+            )
+
+            isRunning = true
+            updateNotification("الحد الأقصى الحالي: $kbps KB/s")
+
+            val tunFd = pfd.fd
+            val configPath = configFile.absolutePath
+
+            tunnelThread = Thread {
+                try {
+                    TProxyService.TProxyStartService(configPath, tunFd)
+                } catch (t: Throwable) {
+                    isRunning = false
+                    updateNotification("خطأ تشغيل المحرك: ${t.javaClass.simpleName}: ${t.message}")
+                }
+            }.apply {
+                name = "HevSocks5TunnelThread"
+                start()
+            }
+        } catch (t: Throwable) {
+            isRunning = false
+            updateNotification("خطأ عام: ${t.javaClass.simpleName}: ${t.message}")
         }
     }
 
@@ -174,7 +189,7 @@ class ThrottleVpnService : VpnService() {
         if (isRunning) {
             try {
                 TProxyService.TProxyStopService()
-            } catch (_: Exception) {
+            } catch (_: Throwable) {
             }
         }
         isRunning = false
@@ -183,7 +198,7 @@ class ThrottleVpnService : VpnService() {
         socksServer = null
         try {
             vpnInterface?.close()
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
         }
         vpnInterface = null
     }
