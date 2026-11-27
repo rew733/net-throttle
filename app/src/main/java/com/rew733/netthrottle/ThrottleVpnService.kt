@@ -69,6 +69,15 @@ class ThrottleVpnService : VpnService() {
             "com.android.vending",
             "com.google.android.gms",
             "com.google.android.gsf",
+            "com.google.android.dialer",
+            "com.google.android.contacts",
+            "com.google.android.apps.messaging",
+            "com.google.android.gm",
+            "com.google.android.calendar",
+            "com.google.android.deskclock",
+            "com.google.android.calculator",
+            "com.google.android.apps.safetyhub",
+            "com.google.android.apps.restore",
             "com.google.android.packageinstaller",
             "com.google.android.permissioncontroller",
             "com.motorola."
@@ -81,11 +90,11 @@ class ThrottleVpnService : VpnService() {
     }
 
     private var vpnInterface: ParcelFileDescriptor? = null
-    private val downloadLimiter = TokenBucketLimiter(65 * 1024L)
-    private val uploadLimiter = TokenBucketLimiter(65 * 1024L)
-    private val udpLimiter = TokenBucketLimiter(35 * 1024L)
+    private val downloadLimiter = TokenBucketLimiter(40 * 1024L)
+    private val uploadLimiter = TokenBucketLimiter(40 * 1024L)
+    private val udpLimiter = TokenBucketLimiter(20 * 1024L)
     private var socksServer: LocalSocks5Server? = null
-    private var currentKbps: Int = 100
+    private var currentKbps: Int = 60
     private var routingModeDesc: String = ""
 
     private var foregroundOnlyMode: Boolean = false
@@ -104,7 +113,7 @@ class ThrottleVpnService : VpnService() {
                 val server = socksServer
                 if (server != null) {
                     if (foregroundOnlyMode) {
-                        monitorAndRouteActiveApp(server)
+                        monitorActiveAppWithoutRestart(server)
                     }
                     val curDown = server.totalDownloadBytes.get()
                     val curUp = server.totalUploadBytes.get()
@@ -117,7 +126,7 @@ class ThrottleVpnService : VpnService() {
                     val errs = server.errorCount.get()
                     diagnosticStatus = "نشط ($routingModeDesc) | الحد: $currentKbps KB/s | محظور: $blocked | أخطاء: $errs"
                 }
-                handler.postDelayed(this, 1000L)
+                handler.postDelayed(this, 500L)
             }
         }
     }
@@ -147,7 +156,7 @@ class ThrottleVpnService : VpnService() {
                 return START_NOT_STICKY
             }
             ACTION_UPDATE_SPEED -> {
-                currentKbps = intent.getIntExtra(EXTRA_SPEED_KBPS, 100).coerceAtLeast(1)
+                currentKbps = intent.getIntExtra(EXTRA_SPEED_KBPS, 60).coerceAtLeast(1)
                 applySpeedLimits(currentKbps)
                 updateNotification("$routingModeDesc | الحد: $currentKbps KB/s")
                 return START_STICKY
@@ -164,7 +173,7 @@ class ThrottleVpnService : VpnService() {
                 val throttled = intent.getStringArrayListExtra(EXTRA_PACKAGES) ?: arrayListOf()
                 val blocked = intent.getStringArrayListExtra(EXTRA_BLOCKED_PACKAGES) ?: arrayListOf()
                 foregroundOnlyMode = intent.getBooleanExtra(EXTRA_FOREGROUND_ONLY_MODE, false)
-                currentKbps = intent.getIntExtra(EXTRA_SPEED_KBPS, 100).coerceAtLeast(1)
+                currentKbps = intent.getIntExtra(EXTRA_SPEED_KBPS, 60).coerceAtLeast(1)
                 applySpeedLimits(currentKbps)
                 managedAppNames = collectManagedPackagesWithLabels()
                 lastDetectedActivePkg = null
@@ -219,7 +228,7 @@ class ThrottleVpnService : VpnService() {
         return if (managedAppNames.containsKey(candidate)) candidate else null
     }
 
-    private fun monitorAndRouteActiveApp(server: LocalSocks5Server) {
+    private fun monitorActiveAppWithoutRestart(server: LocalSocks5Server) {
         val activePkg = detectForegroundManagedPackage()
         server.foregroundOnlyEnabled = true
         server.hasActiveForegroundApp = (activePkg != null)
@@ -234,64 +243,7 @@ class ThrottleVpnService : VpnService() {
         if (activePkg != currentTunnelTargetPkg) {
             currentTunnelTargetPkg = activePkg
             server.refresh()
-            rebuildVpnInterfaceForTarget()
             updateNotification("$routingModeDesc | الحد: $currentKbps KB/s")
-        }
-    }
-
-    private fun rebuildVpnInterfaceForTarget() {
-        try {
-            val builder = Builder()
-                .setSession("NetThrottle")
-                .setMtu(1500)
-                .addAddress("10.0.0.2", 32)
-                .addRoute("0.0.0.0", 0)
-                .addDnsServer("8.8.8.8")
-                .addDnsServer("1.1.1.1")
-
-            for (pkg in managedAppNames.keys) {
-                try {
-                    builder.addAllowedApplication(pkg)
-                } catch (_: Exception) {
-                }
-            }
-
-            val newPfd = builder.establish() ?: return
-            val oldPfd = vpnInterface
-            vpnInterface = newPfd
-
-            try {
-                TProxyService.TProxyStopService()
-            } catch (_: Throwable) {
-            }
-            try {
-                oldPfd?.close()
-            } catch (_: Throwable) {
-            }
-
-            val server = socksServer ?: return
-            val configFile = File(cacheDir, "tproxy.conf")
-            configFile.writeText(
-                """
-                tunnel:
-                  name: tun0
-                  mtu: 1500
-                  multi-queue: false
-                  ipv4: 10.0.0.2
-                socks5:
-                  port: ${server.port}
-                  address: 127.0.0.1
-                  udp: 'udp'
-                misc:
-                  task-stack-size: 81920
-                  tcp-buffer-size: 2048
-                  connect-timeout: 5000
-                  read-write-timeout: 60000
-                  log-level: warn
-                """.trimIndent()
-            )
-            TProxyService.TProxyStartService(configFile.absolutePath, newPfd.fd)
-        } catch (_: Throwable) {
         }
     }
 
