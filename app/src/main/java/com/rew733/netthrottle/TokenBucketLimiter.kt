@@ -1,18 +1,18 @@
 package com.rew733.netthrottle
 
-class TokenBucketLimiter(initialBytesPerSecond: Long) {
+class TokenBucketLimiter(bytesPerSecond: Long) {
 
     @Volatile
-    private var bytesPerSecond: Long = initialBytesPerSecond.coerceAtLeast(1024L)
+    private var rateBytesPerSec: Long = bytesPerSecond.coerceAtLeast(512L)
 
-    private var availableTokens: Double = 0.0
-    private var lastRefillNano: Long = System.nanoTime()
+    private var availableTokens: Double = (rateBytesPerSec * 0.25)
+    private var lastRefillNanoTime: Long = System.nanoTime()
     private val lock = Object()
 
     fun updateRate(newBytesPerSecond: Long) {
         synchronized(lock) {
-            bytesPerSecond = newBytesPerSecond.coerceAtLeast(1024L)
-            val maxBurst = bytesPerSecond * 0.2
+            rateBytesPerSec = newBytesPerSecond.coerceAtLeast(512L)
+            val maxBurst = rateBytesPerSec * 0.25
             if (availableTokens > maxBurst) {
                 availableTokens = maxBurst
             }
@@ -21,45 +21,46 @@ class TokenBucketLimiter(initialBytesPerSecond: Long) {
 
     fun consume(bytes: Int) {
         if (bytes <= 0) return
-        val totalCost = (bytes + 54).toDouble()
+        var remaining = bytes.toDouble()
 
-        while (true) {
+        while (remaining > 0.0) {
             var sleepMillis = 0L
             var sleepNanos = 0
 
             synchronized(lock) {
-                refill()
-                if (availableTokens >= totalCost) {
-                    availableTokens -= totalCost
-                    return
+                val now = System.nanoTime()
+                val elapsedSeconds = (now - lastRefillNanoTime) / 1_000_000_000.0
+                if (elapsedSeconds > 0.0) {
+                    // سقف التراكم ربع ثانية فقط لمنع القفزات المفاجئة في العداد
+                    val maxBurst = rateBytesPerSec * 0.25
+                    availableTokens = (availableTokens + elapsedSeconds * rateBytesPerSec)
+                        .coerceAtMost(maxBurst)
+                    lastRefillNanoTime = now
                 }
-                val deficit = totalCost - availableTokens
-                val waitNanos = ((deficit / bytesPerSecond.toDouble()) * 1_000_000_000.0).toLong()
-                if (waitNanos <= 0L) {
+
+                if (availableTokens >= remaining) {
+                    availableTokens -= remaining
+                    remaining = 0.0
+                } else if (availableTokens >= 1.0) {
+                    remaining -= availableTokens
                     availableTokens = 0.0
+                } else {
+                    val deficit = remaining - availableTokens
+                    val waitSeconds = deficit / rateBytesPerSec.toDouble()
+                    val totalWaitNanos = (waitSeconds * 1_000_000_000.0).toLong().coerceAtLeast(1_000_000L)
+                    sleepMillis = totalWaitNanos / 1_000_000L
+                    sleepNanos = (totalWaitNanos % 1_000_000L).toInt()
+                }
+            }
+
+            if (sleepMillis > 0L || sleepNanos > 0) {
+                try {
+                    Thread.sleep(sleepMillis, sleepNanos)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
                     return
                 }
-                sleepMillis = waitNanos / 1_000_000L
-                sleepNanos = (waitNanos % 1_000_000L).toInt()
             }
-
-            try {
-                Thread.sleep(sleepMillis, sleepNanos)
-            } catch (_: InterruptedException) {
-                Thread.currentThread().interrupt()
-                return
-            }
-        }
-    }
-
-    private fun refill() {
-        val now = System.nanoTime()
-        val elapsedNanos = now - lastRefillNano
-        if (elapsedNanos > 0L) {
-            val added = (elapsedNanos / 1_000_000_000.0) * bytesPerSecond.toDouble()
-            val maxBurst = bytesPerSecond * 0.2
-            availableTokens = (availableTokens + added).coerceAtMost(maxBurst)
-            lastRefillNano = now
         }
     }
 }
