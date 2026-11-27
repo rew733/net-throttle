@@ -52,7 +52,7 @@ class LocalSocks5Server(
         running = true
         serverSocket = ServerSocket().apply {
             reuseAddress = true
-            receiveBufferSize = 4096
+            receiveBufferSize = 2048
             bind(InetSocketAddress("127.0.0.1", port))
         }
 
@@ -61,8 +61,8 @@ class LocalSocks5Server(
                 try {
                     val client = serverSocket?.accept() ?: break
                     client.tcpNoDelay = true
-                    client.receiveBufferSize = 4096
-                    client.sendBufferSize = 4096
+                    client.receiveBufferSize = 2048
+                    client.sendBufferSize = 2048
                     client.soTimeout = 25000
                     activeSockets.add(client)
                     executor.execute { handleClient(client) }
@@ -197,9 +197,9 @@ class LocalSocks5Server(
 
             vpnService.protect(remote)
             remote.tcpNoDelay = true
-            // ضبط نافذة الاستقبال قبل الاتصال يجبر الخادم البعيد على عدم إرسال دفعات كبيرة
-            remote.receiveBufferSize = 4096
-            remote.sendBufferSize = 4096
+            // نافذة استقبال صغيرة جداً (2048 بايت) تجبر خادم تيك توك/فيسبوك على خفض سرعة الإرسال فيزيائياً
+            remote.receiveBufferSize = 2048
+            remote.sendBufferSize = 2048
             remote.soTimeout = 20000
             remote.connect(InetSocketAddress(host, port), 10000)
 
@@ -339,17 +339,14 @@ class LocalSocks5Server(
                         val destPort = ((buf[offset].toInt() and 0xFF) shl 8) or (buf[offset + 1].toInt() and 0xFF)
                         offset += 2
 
-                        val payload = buf.copyOfRange(offset, len)
-
-                        // خنق شديد لحزم UDP/QUIC الصادرة (×8) لدفع مشغل الفيديو للانتقال لـ TCP المنضبط
+                        // حظر بروتوكول QUIC (UDP 443) لإجبار تيك توك وفيسبوك ويوتيوب على استخدام TCP المنضبط
                         if (destPort != 53) {
-                            udpLimiter.consume(payload.size * 8)
-                            totalUploadBytes.addAndGet(payload.size.toLong())
+                            blockedCount.incrementAndGet()
+                            continue
                         }
 
+                        val payload = buf.copyOfRange(offset, len)
                         val outSock = DatagramSocket().apply {
-                            receiveBufferSize = 2048
-                            sendBufferSize = 2048
                             soTimeout = 3000
                         }
                         vpnService.protect(outSock)
@@ -360,10 +357,6 @@ class LocalSocks5Server(
                                 val rPkt = DatagramPacket(rBuf, rBuf.size)
                                 outSock.receive(rPkt)
                                 val rData = rPkt.data.copyOf(rPkt.length)
-                                if (destPort != 53) {
-                                    udpLimiter.consume(rData.size)
-                                    totalDownloadBytes.addAndGet(rData.size.toLong())
-                                }
 
                                 val srcIpBytes = destAddr.address
                                 val header = ByteBuffer.allocate(6 + srcIpBytes.size + rData.size).apply {
