@@ -26,10 +26,16 @@ class ThrottleVpnService : VpnService() {
         const val ACTION_START = "com.rew733.netthrottle.START"
         const val ACTION_STOP = "com.rew733.netthrottle.STOP"
         const val ACTION_UPDATE_SPEED = "com.rew733.netthrottle.UPDATE_SPEED"
+        const val ACTION_UPDATE_PORTS = "com.rew733.netthrottle.UPDATE_PORTS"
         const val ACTION_REFRESH = "com.rew733.netthrottle.REFRESH"
+
         const val EXTRA_PACKAGES = "extra_packages"
         const val EXTRA_BLOCKED_PACKAGES = "extra_blocked_packages"
         const val EXTRA_SPEED_KBPS = "extra_speed_kbps"
+        const val EXTRA_OTHER_TCP_KBPS = "extra_other_tcp_kbps"
+        const val EXTRA_BLOCK_QUIC = "extra_block_quic"
+        const val EXTRA_ALLOW_CALLS_UDP = "extra_allow_calls_udp"
+        const val EXTRA_CALLS_PPS = "extra_calls_pps"
         const val EXTRA_FOREGROUND_ONLY_MODE = "extra_foreground_only_mode"
 
         @Volatile
@@ -46,6 +52,23 @@ class ThrottleVpnService : VpnService() {
 
         @Volatile
         var liveConnections: Int = 0
+            private set
+
+        // القياس الحي لكل مسار في التبويب الثالث
+        @Volatile
+        var liveWebTcpKbps: Int = 0
+            private set
+
+        @Volatile
+        var liveOtherTcpKbps: Int = 0
+            private set
+
+        @Volatile
+        var liveCallsUdpKbps: Int = 0
+            private set
+
+        @Volatile
+        var liveQuicBlockedCount: Int = 0
             private set
 
         @Volatile
@@ -90,13 +113,21 @@ class ThrottleVpnService : VpnService() {
     }
 
     private var vpnInterface: ParcelFileDescriptor? = null
-    private val downloadLimiter = TokenBucketLimiter(60 * 1024L)
-    private val uploadLimiter = TokenBucketLimiter(60 * 1024L)
-    private val udpLimiter = TokenBucketLimiter(10 * 1024L)
-    private var socksServer: LocalSocks5Server? = null
-    private var currentKbps: Int = 60
-    private var routingModeDesc: String = ""
 
+    private val webTcpDownLimiter = TokenBucketLimiter(60 * 1024L)
+    private val webTcpUpLimiter = TokenBucketLimiter(60 * 1024L)
+    private val otherTcpDownLimiter = TokenBucketLimiter(30 * 1024L)
+    private val otherTcpUpLimiter = TokenBucketLimiter(30 * 1024L)
+
+    private var socksServer: LocalSocks5Server? = null
+
+    private var currentWebKbps: Int = 60
+    private var currentOtherTcpKbps: Int = 30
+    private var currentBlockQuic: Boolean = true
+    private var currentAllowCallsUdp: Boolean = true
+    private var currentCallsPps: Int = 30
+
+    private var routingModeDesc: String = ""
     private var foregroundOnlyMode: Boolean = false
     private var managedAppNames: Map<String, String> = emptyMap()
     private var lastDetectedActivePkg: String? = null
@@ -104,6 +135,9 @@ class ThrottleVpnService : VpnService() {
 
     private var lastDownBytes = 0L
     private var lastUpBytes = 0L
+    private var lastWebBytes = 0L
+    private var lastOtherBytes = 0L
+    private var lastCallsBytes = 0L
 
     private val handler = Handler(Looper.getMainLooper())
 
@@ -117,14 +151,28 @@ class ThrottleVpnService : VpnService() {
                     }
                     val curDown = server.totalDownloadBytes.get()
                     val curUp = server.totalUploadBytes.get()
-                    liveDownKbps = ((curDown - lastDownBytes) / 1024L).toInt().coerceAtLeast(0)
-                    liveUpKbps = ((curUp - lastUpBytes) / 1024L).toInt().coerceAtLeast(0)
+                    val curWeb = server.webTcpBytes.get()
+                    val curOther = server.otherTcpBytes.get()
+                    val curCalls = server.callsUdpBytes.get()
+
+                    // القراءة كل 500ms لذا نضرب الفرق في 2 للحصول على معدل الثانية
+                    liveDownKbps = (((curDown - lastDownBytes) * 2) / 1024L).toInt().coerceAtLeast(0)
+                    liveUpKbps = (((curUp - lastUpBytes) * 2) / 1024L).toInt().coerceAtLeast(0)
+                    liveWebTcpKbps = (((curWeb - lastWebBytes) * 2) / 1024L).toInt().coerceAtLeast(0)
+                    liveOtherTcpKbps = (((curOther - lastOtherBytes) * 2) / 1024L).toInt().coerceAtLeast(0)
+                    liveCallsUdpKbps = (((curCalls - lastCallsBytes) * 2) / 1024L).toInt().coerceAtLeast(0)
+
                     lastDownBytes = curDown
                     lastUpBytes = curUp
+                    lastWebBytes = curWeb
+                    lastOtherBytes = curOther
+                    lastCallsBytes = curCalls
+
                     liveConnections = server.activeConnections.get()
+                    liveQuicBlockedCount = server.quicBlockedCount.get()
                     val blocked = server.blockedCount.get()
                     val errs = server.errorCount.get()
-                    diagnosticStatus = "نشط ($routingModeDesc) | الحد: $currentKbps KB/s | محظور: $blocked | أخطاء: $errs"
+                    diagnosticStatus = "نشط ($routingModeDesc) | Web: $currentWebKbps KB/s | محظور: $blocked | أخطاء: $errs"
                 }
                 handler.postDelayed(this, 500L)
             }
@@ -140,13 +188,19 @@ class ThrottleVpnService : VpnService() {
         }
     }
 
-    private fun applySpeedLimits(kbps: Int) {
-        val totalBytes = kbps * 1024L
-        val tcpBytes = totalBytes.coerceAtLeast(1024L)
-        val udpBytes = (totalBytes * 0.15).toLong().coerceAtLeast(512L)
-        downloadLimiter.updateRate(tcpBytes)
-        uploadLimiter.updateRate(tcpBytes)
-        udpLimiter.updateRate(udpBytes)
+    private fun applyPortRulesToServer() {
+        val webBytes = currentWebKbps.coerceAtLeast(1) * 1024L
+        val otherBytes = currentOtherTcpKbps.coerceAtLeast(1) * 1024L
+        webTcpDownLimiter.updateRate(webBytes)
+        webTcpUpLimiter.updateRate(webBytes)
+        otherTcpDownLimiter.updateRate(otherBytes)
+        otherTcpUpLimiter.updateRate(otherBytes)
+
+        socksServer?.let { server ->
+            server.blockQuicUdp443 = currentBlockQuic
+            server.allowCallsUdp = currentAllowCallsUdp
+            server.maxCallsPacketsPerSec = currentCallsPps.coerceAtLeast(1)
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -156,9 +210,19 @@ class ThrottleVpnService : VpnService() {
                 return START_NOT_STICKY
             }
             ACTION_UPDATE_SPEED -> {
-                currentKbps = intent.getIntExtra(EXTRA_SPEED_KBPS, 60).coerceAtLeast(1)
-                applySpeedLimits(currentKbps)
-                updateNotification("$routingModeDesc | الحد: $currentKbps KB/s")
+                currentWebKbps = intent.getIntExtra(EXTRA_SPEED_KBPS, 60).coerceAtLeast(1)
+                applyPortRulesToServer()
+                updateNotification("$routingModeDesc | الحد: $currentWebKbps KB/s")
+                return START_STICKY
+            }
+            ACTION_UPDATE_PORTS -> {
+                currentWebKbps = intent.getIntExtra(EXTRA_SPEED_KBPS, currentWebKbps).coerceAtLeast(1)
+                currentOtherTcpKbps = intent.getIntExtra(EXTRA_OTHER_TCP_KBPS, currentOtherTcpKbps).coerceAtLeast(1)
+                currentBlockQuic = intent.getBooleanExtra(EXTRA_BLOCK_QUIC, currentBlockQuic)
+                currentAllowCallsUdp = intent.getBooleanExtra(EXTRA_ALLOW_CALLS_UDP, currentAllowCallsUdp)
+                currentCallsPps = intent.getIntExtra(EXTRA_CALLS_PPS, currentCallsPps).coerceAtLeast(1)
+                applyPortRulesToServer()
+                updateNotification("$routingModeDesc | Web: $currentWebKbps KB/s")
                 return START_STICKY
             }
             ACTION_REFRESH -> {
@@ -173,13 +237,18 @@ class ThrottleVpnService : VpnService() {
                 val throttled = intent.getStringArrayListExtra(EXTRA_PACKAGES) ?: arrayListOf()
                 val blocked = intent.getStringArrayListExtra(EXTRA_BLOCKED_PACKAGES) ?: arrayListOf()
                 foregroundOnlyMode = intent.getBooleanExtra(EXTRA_FOREGROUND_ONLY_MODE, false)
-                currentKbps = intent.getIntExtra(EXTRA_SPEED_KBPS, 60).coerceAtLeast(1)
-                applySpeedLimits(currentKbps)
+                currentWebKbps = intent.getIntExtra(EXTRA_SPEED_KBPS, 60).coerceAtLeast(1)
+                currentOtherTcpKbps = intent.getIntExtra(EXTRA_OTHER_TCP_KBPS, 30).coerceAtLeast(1)
+                currentBlockQuic = intent.getBooleanExtra(EXTRA_BLOCK_QUIC, true)
+                currentAllowCallsUdp = intent.getBooleanExtra(EXTRA_ALLOW_CALLS_UDP, true)
+                currentCallsPps = intent.getIntExtra(EXTRA_CALLS_PPS, 30).coerceAtLeast(1)
+
+                applyPortRulesToServer()
                 managedAppNames = collectManagedPackagesWithLabels()
                 lastDetectedActivePkg = null
                 currentTunnelTargetPkg = "__NONE__"
                 startForegroundServiceWithNotification("جاري التشغيل...")
-                startVpn(throttled, blocked, currentKbps)
+                startVpn(throttled, blocked, currentWebKbps)
             }
         }
         return START_STICKY
@@ -243,16 +312,16 @@ class ThrottleVpnService : VpnService() {
         if (activePkg != currentTunnelTargetPkg) {
             currentTunnelTargetPkg = activePkg
             server.refresh()
-            updateNotification("$routingModeDesc | الحد: $currentKbps KB/s")
+            updateNotification("$routingModeDesc | الحد: $currentWebKbps KB/s")
         }
     }
 
     private fun performInternalRefresh(reason: String) {
         try {
             socksServer?.refresh()
-            applySpeedLimits(currentKbps)
-            updateNotification("$routingModeDesc | الحد: $currentKbps KB/s ($reason)")
-            diagnosticStatus = "$reason | الحد: $currentKbps KB/s | تم تصفير المقابس"
+            applyPortRulesToServer()
+            updateNotification("$routingModeDesc | الحد: $currentWebKbps KB/s ($reason)")
+            diagnosticStatus = "$reason | الحد: $currentWebKbps KB/s | تم تصفير المقابس"
         } catch (t: Throwable) {
             diagnosticStatus = "خطأ تحديث: ${t.message}"
         }
@@ -307,13 +376,26 @@ class ThrottleVpnService : VpnService() {
         stopVpnInternal()
 
         try {
-            val server = LocalSocks5Server(this, downloadLimiter, uploadLimiter, udpLimiter)
+            val server = LocalSocks5Server(
+                this,
+                webTcpDownLimiter,
+                webTcpUpLimiter,
+                otherTcpDownLimiter,
+                otherTcpUpLimiter
+            )
             server.foregroundOnlyEnabled = foregroundOnlyMode
             server.hasActiveForegroundApp = false
+            server.blockQuicUdp443 = currentBlockQuic
+            server.allowCallsUdp = currentAllowCallsUdp
+            server.maxCallsPacketsPerSec = currentCallsPps
             server.start()
             socksServer = server
+
             lastDownBytes = 0L
             lastUpBytes = 0L
+            lastWebBytes = 0L
+            lastOtherBytes = 0L
+            lastCallsBytes = 0L
 
             val builder = Builder()
                 .setSession("NetThrottle")
@@ -416,6 +498,10 @@ class ThrottleVpnService : VpnService() {
         liveDownKbps = 0
         liveUpKbps = 0
         liveConnections = 0
+        liveWebTcpKbps = 0
+        liveOtherTcpKbps = 0
+        liveCallsUdpKbps = 0
+        liveQuicBlockedCount = 0
         diagnosticStatus = "الحالة: متوقف"
         socksServer?.stop()
         socksServer = null
