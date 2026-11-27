@@ -19,9 +19,10 @@ import java.util.concurrent.atomic.AtomicLong
 
 class LocalSocks5Server(
     private val vpnService: VpnService,
-    private val downloadLimiter: TokenBucketLimiter,
-    private val uploadLimiter: TokenBucketLimiter,
-    private val udpLimiter: TokenBucketLimiter
+    private val webTcpDownLimiter: TokenBucketLimiter,
+    private val webTcpUpLimiter: TokenBucketLimiter,
+    private val otherTcpDownLimiter: TokenBucketLimiter,
+    private val otherTcpUpLimiter: TokenBucketLimiter
 ) {
     private var serverSocket: ServerSocket? = null
     private val executor = Executors.newCachedThreadPool()
@@ -33,17 +34,39 @@ class LocalSocks5Server(
     @Volatile
     var hasActiveForegroundApp: Boolean = false
 
+    // إعدادات تبويب المنافذ والبروتوكولات
+    @Volatile
+    var blockQuicUdp443: Boolean = true
+
+    @Volatile
+    var allowCallsUdp: Boolean = true
+
+    @Volatile
+    var maxCallsPacketsPerSec: Int = 30
+
+    // عدادات القياس الإجمالية
     val totalDownloadBytes = AtomicLong(0L)
     val totalUploadBytes = AtomicLong(0L)
     val activeConnections = AtomicInteger(0)
     val blockedCount = AtomicInteger(0)
     val errorCount = AtomicInteger(0)
 
+    // عدادات القياس الحية لكل مسار على حدة
+    val webTcpBytes = AtomicLong(0L)
+    val otherTcpBytes = AtomicLong(0L)
+    val callsUdpBytes = AtomicLong(0L)
+    val quicBlockedCount = AtomicInteger(0)
+
     @Volatile
     var lastError: String = "لا توجد أخطاء"
 
     @Volatile
     private var running = false
+
+    // مراقب معدل حزم المكالمات (Packet Rate Limiter)
+    private var callsWindowStartMs = System.currentTimeMillis()
+    private var callsPacketsInCurrentSec = 0
+    private val callsRateLock = Object()
 
     val port: Int = 10808
 
@@ -99,6 +122,23 @@ class LocalSocks5Server(
         } catch (_: Exception) {
         }
         serverSocket = null
+    }
+
+    private fun tryConsumeCallPacket(): Boolean {
+        if (!allowCallsUdp) return false
+        val limit = maxCallsPacketsPerSec.coerceAtLeast(1)
+        synchronized(callsRateLock) {
+            val now = System.currentTimeMillis()
+            if (now - callsWindowStartMs >= 1000L) {
+                callsWindowStartMs = now
+                callsPacketsInCurrentSec = 0
+            }
+            if (callsPacketsInCurrentSec < limit) {
+                callsPacketsInCurrentSec++
+                return true
+            }
+            return false
+        }
     }
 
     private fun handleClient(client: Socket) {
@@ -190,14 +230,18 @@ class LocalSocks5Server(
     ) {
         if (!running || client.isClosed) return
 
+        val isWebPort = (port == 80 || port == 443)
+        val downLimiter = if (isWebPort) webTcpDownLimiter else otherTcpDownLimiter
+        val upLimiter = if (isWebPort) webTcpUpLimiter else otherTcpUpLimiter
+        val routeCounter = if (isWebPort) webTcpBytes else otherTcpBytes
+
         val remote = Socket()
         activeSockets.add(remote)
         try {
-            downloadLimiter.consume(1500)
+            downLimiter.consume(1500)
 
             vpnService.protect(remote)
             remote.tcpNoDelay = true
-            // نافذة استقبال صغيرة جداً (2048 بايت) تجبر خادم تيك توك/فيسبوك على خفض سرعة الإرسال فيزيائياً
             remote.receiveBufferSize = 2048
             remote.sendBufferSize = 2048
             remote.soTimeout = 20000
@@ -216,8 +260,9 @@ class LocalSocks5Server(
                         val read = clientIn.read(buf)
                         if (read == -1) break
                         if (read > 0) {
-                            uploadLimiter.consume(read)
+                            upLimiter.consume(read)
                             totalUploadBytes.addAndGet(read.toLong())
+                            routeCounter.addAndGet(read.toLong())
                             remoteOut.write(buf, 0, read)
                             remoteOut.flush()
                         }
@@ -237,8 +282,9 @@ class LocalSocks5Server(
                     val read = remoteIn.read(buf)
                     if (read == -1) break
                     if (read > 0) {
-                        downloadLimiter.consume(read)
+                        downLimiter.consume(read)
                         totalDownloadBytes.addAndGet(read.toLong())
+                        routeCounter.addAndGet(read.toLong())
                         clientOut.write(buf, 0, read)
                         clientOut.flush()
                     }
@@ -339,13 +385,27 @@ class LocalSocks5Server(
                         val destPort = ((buf[offset].toInt() and 0xFF) shl 8) or (buf[offset + 1].toInt() and 0xFF)
                         offset += 2
 
-                        // حظر بروتوكول QUIC (UDP 443) لإجبار تيك توك وفيسبوك ويوتيوب على استخدام TCP المنضبط
+                        // 1. المسار الأول: DNS (منفذ 53) يمر دائماً بلا تأخير
                         if (destPort != 53) {
-                            blockedCount.incrementAndGet()
-                            continue
+                            // 2. المسار الثاني: QUIC / UDP 443
+                            if (destPort == 443 && blockQuicUdp443) {
+                                quicBlockedCount.incrementAndGet()
+                                blockedCount.incrementAndGet()
+                                continue
+                            }
+                            // 3. المسار الثالث: المكالمات وباقي UDP
+                            if (!tryConsumeCallPacket()) {
+                                blockedCount.incrementAndGet()
+                                continue
+                            }
                         }
 
                         val payload = buf.copyOfRange(offset, len)
+                        if (destPort != 53) {
+                            totalUploadBytes.addAndGet(payload.size.toLong())
+                            callsUdpBytes.addAndGet(payload.size.toLong())
+                        }
+
                         val outSock = DatagramSocket().apply {
                             soTimeout = 3000
                         }
@@ -357,6 +417,11 @@ class LocalSocks5Server(
                                 val rPkt = DatagramPacket(rBuf, rBuf.size)
                                 outSock.receive(rPkt)
                                 val rData = rPkt.data.copyOf(rPkt.length)
+
+                                if (destPort != 53) {
+                                    totalDownloadBytes.addAndGet(rData.size.toLong())
+                                    callsUdpBytes.addAndGet(rData.size.toLong())
+                                }
 
                                 val srcIpBytes = destAddr.address
                                 val header = ByteBuffer.allocate(6 + srcIpBytes.size + rData.size).apply {
