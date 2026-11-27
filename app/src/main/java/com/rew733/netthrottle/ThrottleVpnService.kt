@@ -116,17 +116,17 @@ class ThrottleVpnService : VpnService() {
 
     private val webTcpDownLimiter = TokenBucketLimiter(60 * 1024L)
     private val webTcpUpLimiter = TokenBucketLimiter(60 * 1024L)
-    private val otherTcpDownLimiter = TokenBucketLimiter(30 * 1024L)
-    private val otherTcpUpLimiter = TokenBucketLimiter(30 * 1024L)
+    private val otherTcpDownLimiter = TokenBucketLimiter(25 * 1024L)
+    private val otherTcpUpLimiter = TokenBucketLimiter(25 * 1024L)
 
     private var socksServer: LocalSocks5Server? = null
 
     private var currentWebKbps: Int = 60
-    private var currentOtherTcpKbps: Int = 30
+    private var currentOtherTcpKbps: Int = 25
     private var currentBlockQuic: Boolean = true
     private var currentAllowCallsUdp: Boolean = true
-    private var currentCallsPps: Int = 30
-    private var currentMaxConns: Int = 3
+    private var currentCallsPps: Int = 15
+    private var currentMaxConns: Int = 2
 
     private var routingModeDesc: String = ""
     private var foregroundOnlyMode: Boolean = false
@@ -241,11 +241,11 @@ class ThrottleVpnService : VpnService() {
                 val blocked = intent.getStringArrayListExtra(EXTRA_BLOCKED_PACKAGES) ?: arrayListOf()
                 foregroundOnlyMode = intent.getBooleanExtra(EXTRA_FOREGROUND_ONLY_MODE, false)
                 currentWebKbps = intent.getIntExtra(EXTRA_SPEED_KBPS, 60).coerceAtLeast(1)
-                currentOtherTcpKbps = intent.getIntExtra(EXTRA_OTHER_TCP_KBPS, 30).coerceAtLeast(1)
+                currentOtherTcpKbps = intent.getIntExtra(EXTRA_OTHER_TCP_KBPS, 25).coerceAtLeast(1)
                 currentBlockQuic = intent.getBooleanExtra(EXTRA_BLOCK_QUIC, true)
                 currentAllowCallsUdp = intent.getBooleanExtra(EXTRA_ALLOW_CALLS_UDP, true)
-                currentCallsPps = intent.getIntExtra(EXTRA_CALLS_PPS, 30).coerceAtLeast(1)
-                currentMaxConns = intent.getIntExtra(EXTRA_MAX_CONCURRENT_CONNS, 3).coerceAtLeast(0)
+                currentCallsPps = intent.getIntExtra(EXTRA_CALLS_PPS, 15).coerceAtLeast(1)
+                currentMaxConns = intent.getIntExtra(EXTRA_MAX_CONCURRENT_CONNS, 2).coerceAtLeast(0)
 
                 applyPortRulesToServer()
                 scanPackages()
@@ -415,47 +415,35 @@ class ThrottleVpnService : VpnService() {
                 .addDnsServer("8.8.8.8")
                 .addDnsServer("1.1.1.1")
 
-            if (foregroundOnlyMode || (throttledPackages.isEmpty() && blockedPackages.isEmpty())) {
-                try {
-                    builder.addDisallowedApplication(packageName)
-                } catch (_: Exception) {
-                }
-                for (pkg in allInstalledPackages) {
-                    if (isProtectedSystemPackage(pkg)) {
-                        try {
-                            builder.addDisallowedApplication(pkg)
-                        } catch (_: Exception) {
-                        }
-                    }
-                }
-                routingModeDesc = if (foregroundOnlyMode) "النشط فقط: إحكام شامل" else "شامل للتطبيقات"
-            } else {
-                var addedCount = 0
-                for (pkg in throttledPackages) {
-                    if (pkg == packageName) continue
+            // استخدام addDisallowedApplication دائماً لضمان عدم هروب أي عملية فرعية لتيك توك أو فيسبوك خارج النفق
+            try {
+                builder.addDisallowedApplication(packageName)
+            } catch (_: Exception) {
+            }
+
+            val selectedSet = throttledPackages.toSet()
+            val hasExplicitSelection = !foregroundOnlyMode && selectedSet.isNotEmpty() && selectedSet.size < managedAppNames.size
+
+            for (pkg in allInstalledPackages) {
+                if (pkg == packageName) continue
+                if (isProtectedSystemPackage(pkg)) {
                     try {
-                        builder.addAllowedApplication(pkg)
-                        addedCount++
+                        builder.addDisallowedApplication(pkg)
+                    } catch (_: Exception) {
+                    }
+                } else if (hasExplicitSelection && managedAppNames.containsKey(pkg) && !selectedSet.contains(pkg)) {
+                    // إذا حدد المستخدم تطبيقات معينة فقط، نستثني غير المحددة من التقييد
+                    try {
+                        builder.addDisallowedApplication(pkg)
                     } catch (_: Exception) {
                     }
                 }
-                if (addedCount == 0) {
-                    try {
-                        builder.addDisallowedApplication(packageName)
-                    } catch (_: Exception) {
-                    }
-                    for (pkg in allInstalledPackages) {
-                        if (isProtectedSystemPackage(pkg)) {
-                            try {
-                                builder.addDisallowedApplication(pkg)
-                            } catch (_: Exception) {
-                            }
-                        }
-                    }
-                    routingModeDesc = "شامل للتطبيقات"
-                } else {
-                    routingModeDesc = "محدد ($addedCount تطبيق)"
-                }
+            }
+
+            routingModeDesc = when {
+                foregroundOnlyMode -> "النشط فقط: إحكام شامل"
+                hasExplicitSelection -> "محدد (${selectedSet.size} تطبيق)"
+                else -> "شامل إحكام كلي"
             }
 
             val pfd = builder.establish()
