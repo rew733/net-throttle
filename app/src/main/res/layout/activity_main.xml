@@ -44,7 +44,7 @@
             app:cornerRadius="12dp" />
     </LinearLayout>
 
-    <!-- بطاقة إدخال السرعة كتابةً -->
+    <!-- بطاقة إدخال السرعة الأساسية (TCP 80/443) -->
     <LinearLayout
         android:id="@+id/speedControlCard"
         android:layout_width="match_parent"
@@ -58,9 +58,9 @@
         <TextView
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="الحد (KB/s):"
+            android:text="الحد الأساسي (KB/s):"
             android:textColor="#CCCCCC"
-            android:textSize="14sp"
+            android:textSize="13sp"
             android:layout_marginEnd="8dp" />
 
         <EditText
@@ -72,7 +72,7 @@
             android:inputType="number"
             android:maxLength="6"
             android:gravity="center"
-            android:text="100"
+            android:text="60"
             android:textColor="#4FC3F7"
             android:textSize="17sp"
             android:textStyle="bold"
@@ -89,7 +89,7 @@
             app:cornerRadius="10dp" />
     </LinearLayout>
 
-    <!-- خيار: التطبيق النشط على الشاشة فقط (حظر الخلفية وحماية النظام) -->
+    <!-- خيار: التطبيق النشط على الشاشة فقط -->
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
@@ -97,7 +97,7 @@
         android:gravity="center_vertical"
         android:background="#1B262C"
         android:paddingHorizontal="12dp"
-        android:paddingVertical="6dp"
+        android:paddingVertical="4dp"
         android:layout_marginBottom="8dp">
 
         <com.google.android.material.switchmaterial.SwitchMaterial
@@ -159,7 +159,7 @@
             android:layout_marginTop="2dp" />
     </LinearLayout>
 
-    <!-- التبويبات: تحديد السرعة / حظر البيانات -->
+    <!-- التبويبات الثلاثة: تحديد السرعة / حظر البيانات / المنافذ -->
     <com.google.android.material.tabs.TabLayout
         android:id="@+id/tabLayout"
         android:layout_width="match_parent"
@@ -179,53 +179,321 @@
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:text="حظر البيانات" />
+
+        <com.google.android.material.tabs.TabItem
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="المنافذ" />
     </com.google.android.material.tabs.TabLayout>
 
-    <!-- البحث وأزرار تحديد الكل / إلغاء الكل -->
+    <!-- حاوية التبويب الأول والثاني (قائمة التطبيقات والبحث) -->
     <LinearLayout
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:orientation="horizontal"
-        android:gravity="center_vertical"
-        android:layout_marginBottom="8dp">
-
-        <EditText
-            android:id="@+id/etSearch"
-            android:layout_width="0dp"
-            android:layout_height="42dp"
-            android:layout_weight="1"
-            android:background="#1E1E1E"
-            android:hint="بحث عن تطبيق..."
-            android:textColorHint="#888888"
-            android:textColor="#FFFFFF"
-            android:paddingHorizontal="12dp"
-            android:textSize="14sp"
-            android:singleLine="true" />
-
-        <com.google.android.material.button.MaterialButton
-            android:id="@+id/btnSelectAll"
-            style="@style/Widget.Material3.Button.TextButton"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="الكل"
-            android:textColor="#4FC3F7"
-            android:minWidth="48dp" />
-
-        <com.google.android.material.button.MaterialButton
-            android:id="@+id/btnDeselectAll"
-            style="@style/Widget.Material3.Button.TextButton"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="إلغاء"
-            android:textColor="#EF5350"
-            android:minWidth="48dp" />
-    </LinearLayout>
-
-    <!-- قائمة التطبيقات -->
-    <androidx.recyclerview.widget.RecyclerView
-        android:id="@+id/rvApps"
+        android:id="@+id/appsContainer"
         android:layout_width="match_parent"
         android:layout_height="0dp"
-        android:layout_weight="1" />
+        android:layout_weight="1"
+        android:orientation="vertical">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center_vertical"
+            android:layout_marginBottom="8dp">
+
+            <EditText
+                android:id="@+id/etSearch"
+                android:layout_width="0dp"
+                android:layout_height="42dp"
+                android:layout_weight="1"
+                android:background="#1E1E1E"
+                android:hint="بحث عن تطبيق..."
+                android:textColorHint="#888888"
+                android:textColor="#FFFFFF"
+                android:paddingHorizontal="12dp"
+                android:textSize="14sp"
+                android:singleLine="true" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btnSelectAll"
+                style="@style/Widget.Material3.Button.TextButton"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="الكل"
+                android:textColor="#4FC3F7"
+                android:minWidth="48dp" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btnDeselectAll"
+                style="@style/Widget.Material3.Button.TextButton"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="إلغاء"
+                android:textColor="#EF5350"
+                android:minWidth="48dp" />
+        </LinearLayout>
+
+        <androidx.recyclerview.widget.RecyclerView
+            android:id="@+id/rvApps"
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1" />
+    </LinearLayout>
+
+    <!-- حاوية التبويب الثالث (إدارة المنافذ والبروتوكولات والقياس الحي لكل مسار) -->
+    <ScrollView
+        android:id="@+id/portsContainer"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:visibility="gone">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical">
+
+            <!-- المسار 1: تصفح وبث TCP القياسي (80 / 443) -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:background="#1E1E1E"
+                android:padding="12dp"
+                android:layout_marginBottom="8dp">
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal"
+                    android:gravity="center_vertical">
+
+                    <TextView
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:text="1. الويب والفيديو (TCP 80 / 443)"
+                        android:textColor="#4FC3F7"
+                        android:textSize="14sp"
+                        android:textStyle="bold" />
+
+                    <TextView
+                        android:id="@+id/tvWebTcpLive"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="الحي: 0 KB/s"
+                        android:textColor="#A5D6A7"
+                        android:textSize="13sp"
+                        android:textStyle="bold" />
+                </LinearLayout>
+
+                <TextView
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="يتبع الحد الأساسي المكتوب في الأعلى مع ضبط نافذة الاستقبال."
+                    android:textColor="#9E9E9E"
+                    android:textSize="12sp"
+                    android:layout_marginTop="4dp" />
+            </LinearLayout>
+
+            <!-- المسار 2: بث الفيديو السريع UDP 443 (QUIC) -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:background="#1E1E1E"
+                android:padding="12dp"
+                android:layout_marginBottom="8dp">
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal"
+                    android:gravity="center_vertical">
+
+                    <TextView
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:text="2. فيديو UDP 443 (QUIC)"
+                        android:textColor="#FFB74D"
+                        android:textSize="14sp"
+                        android:textStyle="bold" />
+
+                    <TextView
+                        android:id="@+id/tvQuicLive"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="محظور: 0"
+                        android:textColor="#EF9A9A"
+                        android:textSize="13sp"
+                        android:textStyle="bold" />
+                </LinearLayout>
+
+                <com.google.android.material.switchmaterial.SwitchMaterial
+                    android:id="@+id/switchBlockQuic"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:checked="true"
+                    android:text="حظر QUIC (إجبار تيك توك وفيسبوك على TCP المنضبط)"
+                    android:textColor="#FFFFFF"
+                    android:textSize="12sp"
+                    android:layout_marginTop="4dp" />
+            </LinearLayout>
+
+            <!-- المسار 3: المكالمات الصوتية وباقي UDP -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:background="#1E1E1E"
+                android:padding="12dp"
+                android:layout_marginBottom="8dp">
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal"
+                    android:gravity="center_vertical">
+
+                    <TextView
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:text="3. المكالمات وباقي UDP"
+                        android:textColor="#81C784"
+                        android:textSize="14sp"
+                        android:textStyle="bold" />
+
+                    <TextView
+                        android:id="@+id/tvCallsUdpLive"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="الحي: 0 KB/s"
+                        android:textColor="#A5D6A7"
+                        android:textSize="13sp"
+                        android:textStyle="bold" />
+                </LinearLayout>
+
+                <com.google.android.material.switchmaterial.SwitchMaterial
+                    android:id="@+id/switchAllowCallsUdp"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:checked="true"
+                    android:text="السماح بحزم المكالمات الصوتية (WebRTC / STUN)"
+                    android:textColor="#FFFFFF"
+                    android:textSize="12sp"
+                    android:layout_marginTop="4dp" />
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal"
+                    android:gravity="center_vertical"
+                    android:layout_marginTop="4dp">
+
+                    <TextView
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="حد حزم UDP في الثانية:"
+                        android:textColor="#CCCCCC"
+                        android:textSize="12sp"
+                        android:layout_marginEnd="8dp" />
+
+                    <EditText
+                        android:id="@+id/etCallsPps"
+                        android:layout_width="80dp"
+                        android:layout_height="38dp"
+                        android:background="#2A2A2A"
+                        android:inputType="number"
+                        android:maxLength="4"
+                        android:gravity="center"
+                        android:text="30"
+                        android:textColor="#81C784"
+                        android:textSize="15sp"
+                        android:textStyle="bold"
+                        android:singleLine="true" />
+                </LinearLayout>
+            </LinearLayout>
+
+            <!-- المسار 4: منافذ TCP الأخرى -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:background="#1E1E1E"
+                android:padding="12dp"
+                android:layout_marginBottom="8dp">
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal"
+                    android:gravity="center_vertical">
+
+                    <TextView
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:text="4. منافذ TCP الأخرى (Other Ports)"
+                        android:textColor="#BA68C8"
+                        android:textSize="14sp"
+                        android:textStyle="bold" />
+
+                    <TextView
+                        android:id="@+id/tvOtherTcpLive"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="الحي: 0 KB/s"
+                        android:textColor="#A5D6A7"
+                        android:textSize="13sp"
+                        android:textStyle="bold" />
+                </LinearLayout>
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal"
+                    android:gravity="center_vertical"
+                    android:layout_marginTop="6dp">
+
+                    <TextView
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="الحد المخصص (KB/s):"
+                        android:textColor="#CCCCCC"
+                        android:textSize="12sp"
+                        android:layout_marginEnd="8dp" />
+
+                    <EditText
+                        android:id="@+id/etOtherTcpSpeed"
+                        android:layout_width="90dp"
+                        android:layout_height="38dp"
+                        android:background="#2A2A2A"
+                        android:inputType="number"
+                        android:maxLength="6"
+                        android:gravity="center"
+                        android:text="30"
+                        android:textColor="#BA68C8"
+                        android:textSize="15sp"
+                        android:textStyle="bold"
+                        android:singleLine="true" />
+                </LinearLayout>
+            </LinearLayout>
+
+            <!-- زر حفظ وتطبيق إعدادات المنافذ فوراً -->
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btnApplyPorts"
+                android:layout_width="match_parent"
+                android:layout_height="46dp"
+                android:text="تطبيق وحفظ إعدادات المنافذ"
+                android:textColor="#FFFFFF"
+                android:textSize="14sp"
+                android:textStyle="bold"
+                app:backgroundTint="#00897B"
+                app:cornerRadius="12dp" />
+
+        </LinearLayout>
+    </ScrollView>
 
 </LinearLayout>
