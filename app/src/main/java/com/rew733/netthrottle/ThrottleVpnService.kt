@@ -36,6 +36,7 @@ class ThrottleVpnService : VpnService() {
         const val EXTRA_BLOCK_QUIC = "extra_block_quic"
         const val EXTRA_ALLOW_CALLS_UDP = "extra_allow_calls_udp"
         const val EXTRA_CALLS_PPS = "extra_calls_pps"
+        const val EXTRA_MAX_CONCURRENT_CONNS = "extra_max_concurrent_conns"
         const val EXTRA_FOREGROUND_ONLY_MODE = "extra_foreground_only_mode"
 
         @Volatile
@@ -125,6 +126,7 @@ class ThrottleVpnService : VpnService() {
     private var currentBlockQuic: Boolean = true
     private var currentAllowCallsUdp: Boolean = true
     private var currentCallsPps: Int = 30
+    private var currentMaxConns: Int = 3
 
     private var routingModeDesc: String = ""
     private var foregroundOnlyMode: Boolean = false
@@ -171,7 +173,7 @@ class ThrottleVpnService : VpnService() {
                     liveQuicBlockedCount = server.quicBlockedCount.get()
                     val blocked = server.blockedCount.get()
                     val errs = server.errorCount.get()
-                    diagnosticStatus = "نشط ($routingModeDesc) | Web: $currentWebKbps KB/s | محظور: $blocked | أخطاء: $errs"
+                    diagnosticStatus = "نشط ($routingModeDesc) | Web: $currentWebKbps KB/s | اتصالات: $currentMaxConns | محظور: $blocked | أخطاء: $errs"
                 }
                 handler.postDelayed(this, 500L)
             }
@@ -199,6 +201,7 @@ class ThrottleVpnService : VpnService() {
             server.blockQuicUdp443 = currentBlockQuic
             server.allowCallsUdp = currentAllowCallsUdp
             server.maxCallsPacketsPerSec = currentCallsPps.coerceAtLeast(1)
+            server.updateMaxConcurrentConnections(currentMaxConns)
         }
     }
 
@@ -220,6 +223,7 @@ class ThrottleVpnService : VpnService() {
                 currentBlockQuic = intent.getBooleanExtra(EXTRA_BLOCK_QUIC, currentBlockQuic)
                 currentAllowCallsUdp = intent.getBooleanExtra(EXTRA_ALLOW_CALLS_UDP, currentAllowCallsUdp)
                 currentCallsPps = intent.getIntExtra(EXTRA_CALLS_PPS, currentCallsPps).coerceAtLeast(1)
+                currentMaxConns = intent.getIntExtra(EXTRA_MAX_CONCURRENT_CONNS, currentMaxConns).coerceAtLeast(0)
                 applyPortRulesToServer()
                 updateNotification("$routingModeDesc | Web: $currentWebKbps KB/s")
                 return START_STICKY
@@ -241,6 +245,7 @@ class ThrottleVpnService : VpnService() {
                 currentBlockQuic = intent.getBooleanExtra(EXTRA_BLOCK_QUIC, true)
                 currentAllowCallsUdp = intent.getBooleanExtra(EXTRA_ALLOW_CALLS_UDP, true)
                 currentCallsPps = intent.getIntExtra(EXTRA_CALLS_PPS, 30).coerceAtLeast(1)
+                currentMaxConns = intent.getIntExtra(EXTRA_MAX_CONCURRENT_CONNS, 3).coerceAtLeast(0)
 
                 applyPortRulesToServer()
                 scanPackages()
@@ -390,6 +395,7 @@ class ThrottleVpnService : VpnService() {
             server.blockQuicUdp443 = currentBlockQuic
             server.allowCallsUdp = currentAllowCallsUdp
             server.maxCallsPacketsPerSec = currentCallsPps
+            server.updateMaxConcurrentConnections(currentMaxConns)
             server.start()
             socksServer = server
 
@@ -410,8 +416,6 @@ class ThrottleVpnService : VpnService() {
                 .addDnsServer("1.1.1.1")
 
             if (foregroundOnlyMode || (throttledPackages.isEmpty() && blockedPackages.isEmpty())) {
-                // استخدام addDisallowedApplication يجبر النواة على تمرير 100% من عمليات تيك توك وفيسبوك الفرعية داخل النفق
-                // مع حماية واستثناء NetThrottle وتطبيقات النظام الحساسة فقط
                 try {
                     builder.addDisallowedApplication(packageName)
                 } catch (_: Exception) {
