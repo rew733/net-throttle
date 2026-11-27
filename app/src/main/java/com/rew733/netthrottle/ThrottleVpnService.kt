@@ -54,7 +54,6 @@ class ThrottleVpnService : VpnService() {
         var liveConnections: Int = 0
             private set
 
-        // القياس الحي لكل مسار في التبويب الثالث
         @Volatile
         var liveWebTcpKbps: Int = 0
             private set
@@ -130,6 +129,7 @@ class ThrottleVpnService : VpnService() {
     private var routingModeDesc: String = ""
     private var foregroundOnlyMode: Boolean = false
     private var managedAppNames: Map<String, String> = emptyMap()
+    private var allInstalledPackages: List<String> = emptyList()
     private var lastDetectedActivePkg: String? = null
     private var currentTunnelTargetPkg: String? = "__NONE__"
 
@@ -155,7 +155,6 @@ class ThrottleVpnService : VpnService() {
                     val curOther = server.otherTcpBytes.get()
                     val curCalls = server.callsUdpBytes.get()
 
-                    // القراءة كل 500ms لذا نضرب الفرق في 2 للحصول على معدل الثانية
                     liveDownKbps = (((curDown - lastDownBytes) * 2) / 1024L).toInt().coerceAtLeast(0)
                     liveUpKbps = (((curUp - lastUpBytes) * 2) / 1024L).toInt().coerceAtLeast(0)
                     liveWebTcpKbps = (((curWeb - lastWebBytes) * 2) / 1024L).toInt().coerceAtLeast(0)
@@ -244,7 +243,7 @@ class ThrottleVpnService : VpnService() {
                 currentCallsPps = intent.getIntExtra(EXTRA_CALLS_PPS, 30).coerceAtLeast(1)
 
                 applyPortRulesToServer()
-                managedAppNames = collectManagedPackagesWithLabels()
+                scanPackages()
                 lastDetectedActivePkg = null
                 currentTunnelTargetPkg = "__NONE__"
                 startForegroundServiceWithNotification("جاري التشغيل...")
@@ -254,7 +253,7 @@ class ThrottleVpnService : VpnService() {
         return START_STICKY
     }
 
-    private fun collectManagedPackagesWithLabels(): Map<String, String> {
+    private fun scanPackages() {
         val pm = packageManager
         val list = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             pm.getInstalledApplications(PackageManager.ApplicationInfoFlags.of(0))
@@ -263,15 +262,18 @@ class ThrottleVpnService : VpnService() {
             pm.getInstalledApplications(0)
         }
         val map = mutableMapOf<String, String>()
+        val all = mutableListOf<String>()
         for (info in list) {
             val pkg = info.packageName
+            all.add(pkg)
             if (pkg == packageName) continue
             if (isProtectedSystemPackage(pkg)) continue
             if (pm.getLaunchIntentForPackage(pkg) != null) {
                 map[pkg] = pm.getApplicationLabel(info).toString()
             }
         }
-        return map
+        managedAppNames = map
+        allInstalledPackages = all
     }
 
     private fun detectForegroundManagedPackage(): String? {
@@ -408,13 +410,21 @@ class ThrottleVpnService : VpnService() {
                 .addDnsServer("1.1.1.1")
 
             if (foregroundOnlyMode || (throttledPackages.isEmpty() && blockedPackages.isEmpty())) {
-                for (pkg in managedAppNames.keys) {
-                    try {
-                        builder.addAllowedApplication(pkg)
-                    } catch (_: Exception) {
+                // استخدام addDisallowedApplication يجبر النواة على تمرير 100% من عمليات تيك توك وفيسبوك الفرعية داخل النفق
+                // مع حماية واستثناء NetThrottle وتطبيقات النظام الحساسة فقط
+                try {
+                    builder.addDisallowedApplication(packageName)
+                } catch (_: Exception) {
+                }
+                for (pkg in allInstalledPackages) {
+                    if (isProtectedSystemPackage(pkg)) {
+                        try {
+                            builder.addDisallowedApplication(pkg)
+                        } catch (_: Exception) {
+                        }
                     }
                 }
-                routingModeDesc = if (foregroundOnlyMode) "النشط فقط: جاري الرصد" else "شامل للتطبيقات"
+                routingModeDesc = if (foregroundOnlyMode) "النشط فقط: إحكام شامل" else "شامل للتطبيقات"
             } else {
                 var addedCount = 0
                 for (pkg in throttledPackages) {
@@ -426,10 +436,16 @@ class ThrottleVpnService : VpnService() {
                     }
                 }
                 if (addedCount == 0) {
-                    for (pkg in managedAppNames.keys) {
-                        try {
-                            builder.addAllowedApplication(pkg)
-                        } catch (_: Exception) {
+                    try {
+                        builder.addDisallowedApplication(packageName)
+                    } catch (_: Exception) {
+                    }
+                    for (pkg in allInstalledPackages) {
+                        if (isProtectedSystemPackage(pkg)) {
+                            try {
+                                builder.addDisallowedApplication(pkg)
+                            } catch (_: Exception) {
+                            }
                         }
                     }
                     routingModeDesc = "شامل للتطبيقات"
