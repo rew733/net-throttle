@@ -52,6 +52,7 @@ class LocalSocks5Server(
         running = true
         serverSocket = ServerSocket().apply {
             reuseAddress = true
+            receiveBufferSize = 4096
             bind(InetSocketAddress("127.0.0.1", port))
         }
 
@@ -60,8 +61,8 @@ class LocalSocks5Server(
                 try {
                     val client = serverSocket?.accept() ?: break
                     client.tcpNoDelay = true
-                    client.receiveBufferSize = 1024
-                    client.sendBufferSize = 1024
+                    client.receiveBufferSize = 4096
+                    client.sendBufferSize = 4096
                     client.soTimeout = 25000
                     activeSockets.add(client)
                     executor.execute { handleClient(client) }
@@ -147,7 +148,6 @@ class LocalSocks5Server(
             }
             val destPort = input.readUnsignedShort()
 
-            // إذا كان وضع التطبيق المفتوح مفعلاً ولا يوجد تطبيق مستخدم مفتوح حالياً (الشاشة مغلقة أو في الرئيسية)
             if (foregroundOnlyEnabled && !hasActiveForegroundApp) {
                 blockedCount.incrementAndGet()
                 output.write(byteArrayOf(0x05, 0x02, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
@@ -193,12 +193,13 @@ class LocalSocks5Server(
         val remote = Socket()
         activeSockets.add(remote)
         try {
-            downloadLimiter.consume(2000)
+            downloadLimiter.consume(1500)
 
             vpnService.protect(remote)
             remote.tcpNoDelay = true
-            remote.receiveBufferSize = 1024
-            remote.sendBufferSize = 1024
+            // ضبط نافذة الاستقبال قبل الاتصال يجبر الخادم البعيد على عدم إرسال دفعات كبيرة
+            remote.receiveBufferSize = 4096
+            remote.sendBufferSize = 4096
             remote.soTimeout = 20000
             remote.connect(InetSocketAddress(host, port), 10000)
 
@@ -209,7 +210,7 @@ class LocalSocks5Server(
             val remoteOut = remote.getOutputStream()
 
             val upFuture = executor.submit {
-                val buf = ByteArray(512)
+                val buf = ByteArray(1024)
                 try {
                     while (running && !client.isClosed && !remote.isClosed) {
                         val read = clientIn.read(buf)
@@ -230,7 +231,7 @@ class LocalSocks5Server(
                 }
             }
 
-            val buf = ByteArray(512)
+            val buf = ByteArray(1024)
             try {
                 while (running && !client.isClosed && !remote.isClosed) {
                     val read = remoteIn.read(buf)
@@ -278,8 +279,8 @@ class LocalSocks5Server(
         clientOut: OutputStream
     ) {
         val udpRelay = DatagramSocket(0, InetAddress.getByName("127.0.0.1")).apply {
-            receiveBufferSize = 1024
-            sendBufferSize = 1024
+            receiveBufferSize = 2048
+            sendBufferSize = 2048
         }
         val relayPort = udpRelay.localPort
 
@@ -328,6 +329,11 @@ class LocalSocks5Server(
                                 offset += dLen
                                 InetAddress.getByName(host)
                             }
+                            0x04 -> {
+                                val ip = buf.copyOfRange(offset, offset + 16)
+                                offset += 16
+                                InetAddress.getByAddress(ip)
+                            }
                             else -> continue
                         }
                         val destPort = ((buf[offset].toInt() and 0xFF) shl 8) or (buf[offset + 1].toInt() and 0xFF)
@@ -335,15 +341,16 @@ class LocalSocks5Server(
 
                         val payload = buf.copyOfRange(offset, len)
 
+                        // خنق شديد لحزم UDP/QUIC الصادرة (×8) لدفع مشغل الفيديو للانتقال لـ TCP المنضبط
                         if (destPort != 53) {
-                            udpLimiter.consume(payload.size * 4)
+                            udpLimiter.consume(payload.size * 8)
                             totalUploadBytes.addAndGet(payload.size.toLong())
                         }
 
                         val outSock = DatagramSocket().apply {
-                            receiveBufferSize = 1024
-                            sendBufferSize = 1024
-                            soTimeout = 4000
+                            receiveBufferSize = 2048
+                            sendBufferSize = 2048
+                            soTimeout = 3000
                         }
                         vpnService.protect(outSock)
                         executor.execute {
