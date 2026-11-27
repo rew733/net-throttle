@@ -17,8 +17,11 @@ import android.os.Process
 import android.provider.Settings
 import android.text.Editable
 import android.text.TextWatcher
+import android.view.View
 import android.view.inputmethod.InputMethodManager
 import android.widget.EditText
+import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
@@ -45,13 +48,33 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnCopyLog: MaterialButton
     private lateinit var tvDiagnosticLog: TextView
     private lateinit var tabLayout: TabLayout
+
+    // حاوية التبويب الأول والثاني
+    private lateinit var appsContainer: LinearLayout
     private lateinit var etSearch: EditText
     private lateinit var btnSelectAll: MaterialButton
     private lateinit var btnDeselectAll: MaterialButton
     private lateinit var rvApps: RecyclerView
     private lateinit var adapter: AppAdapter
 
-    private var currentSpeedKbps: Int = 100
+    // عناصر التبويب الثالث (المنافذ والبروتوكولات)
+    private lateinit var portsContainer: ScrollView
+    private lateinit var tvWebTcpLive: TextView
+    private lateinit var tvQuicLive: TextView
+    private lateinit var switchBlockQuic: SwitchMaterial
+    private lateinit var tvCallsUdpLive: TextView
+    private lateinit var switchAllowCallsUdp: SwitchMaterial
+    private lateinit var etCallsPps: EditText
+    private lateinit var tvOtherTcpLive: TextView
+    private lateinit var etOtherTcpSpeed: EditText
+    private lateinit var btnApplyPorts: MaterialButton
+
+    private var currentSpeedKbps: Int = 60
+    private var currentOtherTcpKbps: Int = 30
+    private var currentBlockQuic: Boolean = true
+    private var currentAllowCallsUdp: Boolean = true
+    private var currentCallsPps: Int = 30
+
     private val uiHandler = Handler(Looper.getMainLooper())
 
     private val uiStatsUpdater = object : Runnable {
@@ -61,6 +84,13 @@ class MainActivity : AppCompatActivity() {
             val conns = ThrottleVpnService.liveConnections
             tvLiveStats.text = "تنزيل: $down KB/s | رفع: $up KB/s | اتصالات: $conns"
             tvDiagnosticLog.text = ThrottleVpnService.diagnosticStatus
+
+            // تحديث العدادات الحية داخل تبويب المنافذ
+            tvWebTcpLive.text = "الحي: ${ThrottleVpnService.liveWebTcpKbps} KB/s"
+            tvQuicLive.text = "محظور: ${ThrottleVpnService.liveQuicBlockedCount}"
+            tvCallsUdpLive.text = "الحي: ${ThrottleVpnService.liveCallsUdpKbps} KB/s"
+            tvOtherTcpLive.text = "الحي: ${ThrottleVpnService.liveOtherTcpKbps} KB/s"
+
             updateToggleButton()
             uiHandler.postDelayed(this, 1000L)
         }
@@ -93,14 +123,37 @@ class MainActivity : AppCompatActivity() {
         btnCopyLog = findViewById(R.id.btnCopyLog)
         tvDiagnosticLog = findViewById(R.id.tvDiagnosticLog)
         tabLayout = findViewById(R.id.tabLayout)
+
+        appsContainer = findViewById(R.id.appsContainer)
         etSearch = findViewById(R.id.etSearch)
         btnSelectAll = findViewById(R.id.btnSelectAll)
         btnDeselectAll = findViewById(R.id.btnDeselectAll)
         rvApps = findViewById(R.id.rvApps)
 
+        portsContainer = findViewById(R.id.portsContainer)
+        tvWebTcpLive = findViewById(R.id.tvWebTcpLive)
+        tvQuicLive = findViewById(R.id.tvQuicLive)
+        switchBlockQuic = findViewById(R.id.switchBlockQuic)
+        tvCallsUdpLive = findViewById(R.id.tvCallsUdpLive)
+        switchAllowCallsUdp = findViewById(R.id.switchAllowCallsUdp)
+        etCallsPps = findViewById(R.id.etCallsPps)
+        tvOtherTcpLive = findViewById(R.id.tvOtherTcpLive)
+        etOtherTcpSpeed = findViewById(R.id.etOtherTcpSpeed)
+        btnApplyPorts = findViewById(R.id.btnApplyPorts)
+
         val prefs = getSharedPreferences("net_throttle_prefs", Context.MODE_PRIVATE)
-        currentSpeedKbps = prefs.getInt("speed_kbps", 100).coerceAtLeast(1)
+        currentSpeedKbps = prefs.getInt("speed_kbps", 60).coerceAtLeast(1)
+        currentOtherTcpKbps = prefs.getInt("other_tcp_kbps", 30).coerceAtLeast(1)
+        currentBlockQuic = prefs.getBoolean("block_quic", true)
+        currentAllowCallsUdp = prefs.getBoolean("allow_calls_udp", true)
+        currentCallsPps = prefs.getInt("calls_pps", 30).coerceAtLeast(1)
+
         switchForegroundOnly.isChecked = prefs.getBoolean("foreground_only_mode", false)
+        etSpeedInput.setText(currentSpeedKbps.toString())
+        etOtherTcpSpeed.setText(currentOtherTcpKbps.toString())
+        switchBlockQuic.isChecked = currentBlockQuic
+        switchAllowCallsUdp.isChecked = currentAllowCallsUdp
+        etCallsPps.setText(currentCallsPps.toString())
 
         switchForegroundOnly.setOnCheckedChangeListener { _, isChecked ->
             if (isChecked && !hasUsageStatsPermission()) {
@@ -128,8 +181,6 @@ class MainActivity : AppCompatActivity() {
         rvApps.layoutManager = LinearLayoutManager(this)
         rvApps.adapter = adapter
 
-        etSpeedInput.setText(currentSpeedKbps.toString())
-
         btnApplySpeed.setOnClickListener {
             val enteredText = etSpeedInput.text.toString().trim()
             val parsed = enteredText.toIntOrNull()
@@ -139,9 +190,7 @@ class MainActivity : AppCompatActivity() {
             }
             currentSpeedKbps = parsed
             prefs.edit().putInt("speed_kbps", currentSpeedKbps).apply()
-
-            val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
-            imm.hideSoftInputFromWindow(etSpeedInput.windowToken, 0)
+            hideKeyboard(etSpeedInput)
 
             if (ThrottleVpnService.isRunning) {
                 val intent = Intent(this, ThrottleVpnService::class.java).apply {
@@ -150,18 +199,55 @@ class MainActivity : AppCompatActivity() {
                 }
                 startService(intent)
             }
-            Toast.makeText(this, "تم ضبط السرعة على $currentSpeedKbps KB/s", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "تم ضبط الحد الأساسي على $currentSpeedKbps KB/s", Toast.LENGTH_SHORT).show()
+        }
+
+        btnApplyPorts.setOnClickListener {
+            val parsedOther = etOtherTcpSpeed.text.toString().trim().toIntOrNull()
+            val parsedPps = etCallsPps.text.toString().trim().toIntOrNull()
+            if (parsedOther == null || parsedOther < 1 || parsedPps == null || parsedPps < 1) {
+                Toast.makeText(this, "أدخل أرقاماً صحيحة أكبر من 0", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+
+            currentOtherTcpKbps = parsedOther
+            currentCallsPps = parsedPps
+            currentBlockQuic = switchBlockQuic.isChecked
+            currentAllowCallsUdp = switchAllowCallsUdp.isChecked
+
+            prefs.edit()
+                .putInt("other_tcp_kbps", currentOtherTcpKbps)
+                .putInt("calls_pps", currentCallsPps)
+                .putBoolean("block_quic", currentBlockQuic)
+                .putBoolean("allow_calls_udp", currentAllowCallsUdp)
+                .apply()
+
+            hideKeyboard(etOtherTcpSpeed)
+
+            if (ThrottleVpnService.isRunning) {
+                val intent = Intent(this, ThrottleVpnService::class.java).apply {
+                    action = ThrottleVpnService.ACTION_UPDATE_PORTS
+                    putExtra(ThrottleVpnService.EXTRA_SPEED_KBPS, currentSpeedKbps)
+                    putExtra(ThrottleVpnService.EXTRA_OTHER_TCP_KBPS, currentOtherTcpKbps)
+                    putExtra(ThrottleVpnService.EXTRA_BLOCK_QUIC, currentBlockQuic)
+                    putExtra(ThrottleVpnService.EXTRA_ALLOW_CALLS_UDP, currentAllowCallsUdp)
+                    putExtra(ThrottleVpnService.EXTRA_CALLS_PPS, currentCallsPps)
+                }
+                startService(intent)
+            }
+            Toast.makeText(this, "تم حفظ وتطبيق إعدادات المنافذ", Toast.LENGTH_SHORT).show()
         }
 
         btnCopyLog.setOnClickListener {
             val report = buildString {
                 appendLine("=== تقرير NetThrottle ===")
-                appendLine("السرعة المحددة: $currentSpeedKbps KB/s")
+                appendLine("الحد الأساسي (Web TCP): $currentSpeedKbps KB/s")
+                appendLine("حظر QUIC (UDP 443): $currentBlockQuic (محظور: ${ThrottleVpnService.liveQuicBlockedCount})")
+                appendLine("مكالمات UDP: $currentAllowCallsUdp ($currentCallsPps pps | الحي: ${ThrottleVpnService.liveCallsUdpKbps} KB/s)")
+                appendLine("منافذ TCP الأخرى: $currentOtherTcpKbps KB/s (الحي: ${ThrottleVpnService.liveOtherTcpKbps} KB/s)")
                 appendLine("وضع التطبيق المفتوح فقط: ${switchForegroundOnly.isChecked}")
                 appendLine("القياس الحي: ${tvLiveStats.text}")
                 appendLine("السجل: ${ThrottleVpnService.diagnosticStatus}")
-                appendLine("تطبيقات التحديد (${adapter.throttledPackages.size}): ${adapter.throttledPackages.joinToString()}")
-                appendLine("تطبيقات الحظر (${adapter.blockedPackages.size}): ${adapter.blockedPackages.joinToString()}")
             }
             val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
             clipboard.setPrimaryClip(ClipData.newPlainText("NetThrottle Log", report))
@@ -183,7 +269,15 @@ class MainActivity : AppCompatActivity() {
 
         tabLayout.addOnTabSelectedListener(object : TabLayout.OnTabSelectedListener {
             override fun onTabSelected(tab: TabLayout.Tab?) {
-                adapter.currentTab = tab?.position ?: 0
+                val pos = tab?.position ?: 0
+                if (pos == 2) {
+                    appsContainer.visibility = View.GONE
+                    portsContainer.visibility = View.VISIBLE
+                } else {
+                    portsContainer.visibility = View.GONE
+                    appsContainer.visibility = View.VISIBLE
+                    adapter.currentTab = pos
+                }
             }
 
             override fun onTabUnselected(tab: TabLayout.Tab?) {}
@@ -234,6 +328,11 @@ class MainActivity : AppCompatActivity() {
 
         requestNotificationPermissionIfNeeded()
         loadInstalledApps()
+    }
+
+    private fun hideKeyboard(view: View) {
+        val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+        imm.hideSoftInputFromWindow(view.windowToken, 0)
     }
 
     override fun onResume() {
@@ -310,6 +409,10 @@ class MainActivity : AppCompatActivity() {
             putStringArrayListExtra(ThrottleVpnService.EXTRA_PACKAGES, ArrayList(adapter.throttledPackages))
             putStringArrayListExtra(ThrottleVpnService.EXTRA_BLOCKED_PACKAGES, ArrayList(adapter.blockedPackages))
             putExtra(ThrottleVpnService.EXTRA_SPEED_KBPS, currentSpeedKbps)
+            putExtra(ThrottleVpnService.EXTRA_OTHER_TCP_KBPS, currentOtherTcpKbps)
+            putExtra(ThrottleVpnService.EXTRA_BLOCK_QUIC, switchBlockQuic.isChecked)
+            putExtra(ThrottleVpnService.EXTRA_ALLOW_CALLS_UDP, switchAllowCallsUdp.isChecked)
+            putExtra(ThrottleVpnService.EXTRA_CALLS_PPS, currentCallsPps)
             putExtra(ThrottleVpnService.EXTRA_FOREGROUND_ONLY_MODE, switchForegroundOnly.isChecked)
         }
         ContextCompat.startForegroundService(this, intent)
