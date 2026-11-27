@@ -44,6 +44,13 @@ class LocalSocks5Server(
     @Volatile
     var maxCallsPacketsPerSec: Int = 30
 
+    // الحد الأقصى للاتصالات المتزامنة (0 = غير محدود)
+    @Volatile
+    var maxConcurrentConnections: Int = 3
+
+    private val tcpSlotLock = Object()
+    private var currentTcpSlotsUsed: Int = 0
+
     // عدادات القياس الإجمالية
     val totalDownloadBytes = AtomicLong(0L)
     val totalUploadBytes = AtomicLong(0L)
@@ -69,6 +76,39 @@ class LocalSocks5Server(
     private val callsRateLock = Object()
 
     val port: Int = 10808
+
+    fun updateMaxConcurrentConnections(limit: Int) {
+        maxConcurrentConnections = limit.coerceAtLeast(0)
+        synchronized(tcpSlotLock) {
+            tcpSlotLock.notifyAll()
+        }
+    }
+
+    private fun acquireTcpSlot(client: Socket): Boolean {
+        synchronized(tcpSlotLock) {
+            while (running && !client.isClosed) {
+                val limit = maxConcurrentConnections
+                if (limit <= 0 || currentTcpSlotsUsed < limit) {
+                    currentTcpSlotsUsed++
+                    return true
+                }
+                try {
+                    tcpSlotLock.wait(250L)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    return false
+                }
+            }
+            return false
+        }
+    }
+
+    private fun releaseTcpSlot() {
+        synchronized(tcpSlotLock) {
+            if (currentTcpSlotsUsed > 0) currentTcpSlotsUsed--
+            tcpSlotLock.notifyAll()
+        }
+    }
 
     fun start() {
         if (running) return
@@ -112,6 +152,9 @@ class LocalSocks5Server(
             iterator.remove()
         }
         activeConnections.set(0)
+        synchronized(tcpSlotLock) {
+            tcpSlotLock.notifyAll()
+        }
     }
 
     fun stop() {
@@ -122,6 +165,10 @@ class LocalSocks5Server(
         } catch (_: Exception) {
         }
         serverSocket = null
+        synchronized(tcpSlotLock) {
+            currentTcpSlotsUsed = 0
+            tcpSlotLock.notifyAll()
+        }
     }
 
     private fun tryConsumeCallPacket(): Boolean {
@@ -230,6 +277,15 @@ class LocalSocks5Server(
     ) {
         if (!running || client.isClosed) return
 
+        // انتظار توفر مقعد ضمن الحد الأقصى للاتصالات المتزامنة
+        if (!acquireTcpSlot(client)) {
+            try {
+                client.close()
+            } catch (_: Exception) {
+            }
+            return
+        }
+
         val isWebPort = (port == 80 || port == 443)
         val downLimiter = if (isWebPort) webTcpDownLimiter else otherTcpDownLimiter
         val upLimiter = if (isWebPort) webTcpUpLimiter else otherTcpUpLimiter
@@ -306,6 +362,7 @@ class LocalSocks5Server(
             } catch (_: Exception) {
             }
         } finally {
+            releaseTcpSlot()
             activeSockets.remove(remote)
             try {
                 remote.close()
@@ -385,15 +442,15 @@ class LocalSocks5Server(
                         val destPort = ((buf[offset].toInt() and 0xFF) shl 8) or (buf[offset + 1].toInt() and 0xFF)
                         offset += 2
 
-                        // 1. المسار الأول: DNS (منفذ 53) يمر دائماً بلا تأخير
+                        // 1. DNS (منفذ 53) يمر دائماً بلا تأخير
                         if (destPort != 53) {
-                            // 2. المسار الثاني: QUIC / UDP 443
+                            // 2. QUIC / UDP 443
                             if (destPort == 443 && blockQuicUdp443) {
                                 quicBlockedCount.incrementAndGet()
                                 blockedCount.incrementAndGet()
                                 continue
                             }
-                            // 3. المسار الثالث: المكالمات وباقي UDP
+                            // 3. المكالمات وباقي UDP
                             if (!tryConsumeCallPacket()) {
                                 blockedCount.incrementAndGet()
                                 continue
