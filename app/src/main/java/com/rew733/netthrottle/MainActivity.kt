@@ -67,6 +67,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var etCallsPps: EditText
     private lateinit var tvOtherTcpLive: TextView
     private lateinit var etOtherTcpSpeed: EditText
+    private lateinit var etMaxConns: EditText
     private lateinit var btnApplyPorts: MaterialButton
 
     private var currentSpeedKbps: Int = 60
@@ -74,6 +75,7 @@ class MainActivity : AppCompatActivity() {
     private var currentBlockQuic: Boolean = true
     private var currentAllowCallsUdp: Boolean = true
     private var currentCallsPps: Int = 30
+    private var currentMaxConns: Int = 3
 
     private val uiHandler = Handler(Looper.getMainLooper())
 
@@ -139,6 +141,7 @@ class MainActivity : AppCompatActivity() {
         etCallsPps = findViewById(R.id.etCallsPps)
         tvOtherTcpLive = findViewById(R.id.tvOtherTcpLive)
         etOtherTcpSpeed = findViewById(R.id.etOtherTcpSpeed)
+        etMaxConns = findViewById(R.id.etMaxConns)
         btnApplyPorts = findViewById(R.id.btnApplyPorts)
 
         val prefs = getSharedPreferences("net_throttle_prefs", Context.MODE_PRIVATE)
@@ -147,6 +150,7 @@ class MainActivity : AppCompatActivity() {
         currentBlockQuic = prefs.getBoolean("block_quic", true)
         currentAllowCallsUdp = prefs.getBoolean("allow_calls_udp", true)
         currentCallsPps = prefs.getInt("calls_pps", 30).coerceAtLeast(1)
+        currentMaxConns = prefs.getInt("max_concurrent_conns", 3).coerceAtLeast(0)
 
         switchForegroundOnly.isChecked = prefs.getBoolean("foreground_only_mode", false)
         etSpeedInput.setText(currentSpeedKbps.toString())
@@ -154,6 +158,7 @@ class MainActivity : AppCompatActivity() {
         switchBlockQuic.isChecked = currentBlockQuic
         switchAllowCallsUdp.isChecked = currentAllowCallsUdp
         etCallsPps.setText(currentCallsPps.toString())
+        etMaxConns.setText(currentMaxConns.toString())
 
         switchForegroundOnly.setOnCheckedChangeListener { _, isChecked ->
             if (isChecked && !hasUsageStatsPermission()) {
@@ -205,24 +210,27 @@ class MainActivity : AppCompatActivity() {
         btnApplyPorts.setOnClickListener {
             val parsedOther = etOtherTcpSpeed.text.toString().trim().toIntOrNull()
             val parsedPps = etCallsPps.text.toString().trim().toIntOrNull()
-            if (parsedOther == null || parsedOther < 1 || parsedPps == null || parsedPps < 1) {
-                Toast.makeText(this, "أدخل أرقاماً صحيحة أكبر من 0", Toast.LENGTH_SHORT).show()
+            val parsedMaxConns = etMaxConns.text.toString().trim().toIntOrNull()
+            if (parsedOther == null || parsedOther < 1 || parsedPps == null || parsedPps < 1 || parsedMaxConns == null || parsedMaxConns < 0) {
+                Toast.makeText(this, "تأكد من إدخال أرقام صحيحة", Toast.LENGTH_SHORT).show()
                 return@setOnClickListener
             }
 
             currentOtherTcpKbps = parsedOther
             currentCallsPps = parsedPps
+            currentMaxConns = parsedMaxConns
             currentBlockQuic = switchBlockQuic.isChecked
             currentAllowCallsUdp = switchAllowCallsUdp.isChecked
 
             prefs.edit()
                 .putInt("other_tcp_kbps", currentOtherTcpKbps)
                 .putInt("calls_pps", currentCallsPps)
+                .putInt("max_concurrent_conns", currentMaxConns)
                 .putBoolean("block_quic", currentBlockQuic)
                 .putBoolean("allow_calls_udp", currentAllowCallsUdp)
                 .apply()
 
-            hideKeyboard(etOtherTcpSpeed)
+            hideKeyboard(etMaxConns)
 
             if (ThrottleVpnService.isRunning) {
                 val intent = Intent(this, ThrottleVpnService::class.java).apply {
@@ -232,10 +240,11 @@ class MainActivity : AppCompatActivity() {
                     putExtra(ThrottleVpnService.EXTRA_BLOCK_QUIC, currentBlockQuic)
                     putExtra(ThrottleVpnService.EXTRA_ALLOW_CALLS_UDP, currentAllowCallsUdp)
                     putExtra(ThrottleVpnService.EXTRA_CALLS_PPS, currentCallsPps)
+                    putExtra(ThrottleVpnService.EXTRA_MAX_CONCURRENT_CONNS, currentMaxConns)
                 }
                 startService(intent)
             }
-            Toast.makeText(this, "تم حفظ وتطبيق إعدادات المنافذ", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "تم حفظ وتطبيق إعدادات المنافذ والاتصالات", Toast.LENGTH_SHORT).show()
         }
 
         btnCopyLog.setOnClickListener {
@@ -245,6 +254,7 @@ class MainActivity : AppCompatActivity() {
                 appendLine("حظر QUIC (UDP 443): $currentBlockQuic (محظور: ${ThrottleVpnService.liveQuicBlockedCount})")
                 appendLine("مكالمات UDP: $currentAllowCallsUdp ($currentCallsPps pps | الحي: ${ThrottleVpnService.liveCallsUdpKbps} KB/s)")
                 appendLine("منافذ TCP الأخرى: $currentOtherTcpKbps KB/s (الحي: ${ThrottleVpnService.liveOtherTcpKbps} KB/s)")
+                appendLine("الحد الأقصى للاتصالات المتزامنة: $currentMaxConns")
                 appendLine("وضع التطبيق المفتوح فقط: ${switchForegroundOnly.isChecked}")
                 appendLine("القياس الحي: ${tvLiveStats.text}")
                 appendLine("السجل: ${ThrottleVpnService.diagnosticStatus}")
@@ -413,6 +423,7 @@ class MainActivity : AppCompatActivity() {
             putExtra(ThrottleVpnService.EXTRA_BLOCK_QUIC, switchBlockQuic.isChecked)
             putExtra(ThrottleVpnService.EXTRA_ALLOW_CALLS_UDP, switchAllowCallsUdp.isChecked)
             putExtra(ThrottleVpnService.EXTRA_CALLS_PPS, currentCallsPps)
+            putExtra(ThrottleVpnService.EXTRA_MAX_CONCURRENT_CONNS, currentMaxConns)
             putExtra(ThrottleVpnService.EXTRA_FOREGROUND_ONLY_MODE, switchForegroundOnly.isChecked)
         }
         ContextCompat.startForegroundService(this, intent)
