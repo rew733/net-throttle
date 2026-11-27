@@ -34,7 +34,6 @@ class LocalSocks5Server(
     @Volatile
     var hasActiveForegroundApp: Boolean = false
 
-    // إعدادات تبويب المنافذ والبروتوكولات
     @Volatile
     var blockQuicUdp443: Boolean = true
 
@@ -44,12 +43,12 @@ class LocalSocks5Server(
     @Volatile
     var maxCallsPacketsPerSec: Int = 30
 
-    // الحد الأقصى للاتصالات المتزامنة (0 = غير محدود)
+    // الحد الأقصى للاتصالات الثقيلة المتزامنة (الفيديوهات/التحميلات)
     @Volatile
-    var maxConcurrentConnections: Int = 3
+    var maxConcurrentConnections: Int = 2
 
-    private val tcpSlotLock = Object()
-    private var currentTcpSlotsUsed: Int = 0
+    private val heavyStreamLock = Object()
+    private var activeHeavyStreams: Int = 0
 
     // عدادات القياس الإجمالية
     val totalDownloadBytes = AtomicLong(0L)
@@ -58,7 +57,7 @@ class LocalSocks5Server(
     val blockedCount = AtomicInteger(0)
     val errorCount = AtomicInteger(0)
 
-    // عدادات القياس الحية لكل مسار على حدة
+    // عدادات القياس الحية لكل مسار
     val webTcpBytes = AtomicLong(0L)
     val otherTcpBytes = AtomicLong(0L)
     val callsUdpBytes = AtomicLong(0L)
@@ -70,30 +69,34 @@ class LocalSocks5Server(
     @Volatile
     private var running = false
 
-    // مراقب معدل حزم المكالمات (Packet Rate Limiter)
     private var callsWindowStartMs = System.currentTimeMillis()
     private var callsPacketsInCurrentSec = 0
     private val callsRateLock = Object()
 
     val port: Int = 10808
 
+    companion object {
+        // أول 12 كيلوبايت من كل اتصال تمر فوراً لفتح الصفحات والتطبيقات بدون تعليق
+        private const val FAST_START_BYTES = 12 * 1024L
+    }
+
     fun updateMaxConcurrentConnections(limit: Int) {
         maxConcurrentConnections = limit.coerceAtLeast(0)
-        synchronized(tcpSlotLock) {
-            tcpSlotLock.notifyAll()
+        synchronized(heavyStreamLock) {
+            heavyStreamLock.notifyAll()
         }
     }
 
-    private fun acquireTcpSlot(client: Socket): Boolean {
-        synchronized(tcpSlotLock) {
-            while (running && !client.isClosed) {
+    private fun acquireHeavyStreamSlot(client: Socket, remote: Socket): Boolean {
+        synchronized(heavyStreamLock) {
+            while (running && !client.isClosed && !remote.isClosed) {
                 val limit = maxConcurrentConnections
-                if (limit <= 0 || currentTcpSlotsUsed < limit) {
-                    currentTcpSlotsUsed++
+                if (limit <= 0 || activeHeavyStreams < limit) {
+                    activeHeavyStreams++
                     return true
                 }
                 try {
-                    tcpSlotLock.wait(250L)
+                    heavyStreamLock.wait(250L)
                 } catch (_: InterruptedException) {
                     Thread.currentThread().interrupt()
                     return false
@@ -103,10 +106,10 @@ class LocalSocks5Server(
         }
     }
 
-    private fun releaseTcpSlot() {
-        synchronized(tcpSlotLock) {
-            if (currentTcpSlotsUsed > 0) currentTcpSlotsUsed--
-            tcpSlotLock.notifyAll()
+    private fun releaseHeavyStreamSlot() {
+        synchronized(heavyStreamLock) {
+            if (activeHeavyStreams > 0) activeHeavyStreams--
+            heavyStreamLock.notifyAll()
         }
     }
 
@@ -115,7 +118,7 @@ class LocalSocks5Server(
         running = true
         serverSocket = ServerSocket().apply {
             reuseAddress = true
-            receiveBufferSize = 2048
+            receiveBufferSize = 4096
             bind(InetSocketAddress("127.0.0.1", port))
         }
 
@@ -124,8 +127,8 @@ class LocalSocks5Server(
                 try {
                     val client = serverSocket?.accept() ?: break
                     client.tcpNoDelay = true
-                    client.receiveBufferSize = 2048
-                    client.sendBufferSize = 2048
+                    client.receiveBufferSize = 4096
+                    client.sendBufferSize = 4096
                     client.soTimeout = 25000
                     activeSockets.add(client)
                     executor.execute { handleClient(client) }
@@ -152,8 +155,8 @@ class LocalSocks5Server(
             iterator.remove()
         }
         activeConnections.set(0)
-        synchronized(tcpSlotLock) {
-            tcpSlotLock.notifyAll()
+        synchronized(heavyStreamLock) {
+            heavyStreamLock.notifyAll()
         }
     }
 
@@ -165,9 +168,9 @@ class LocalSocks5Server(
         } catch (_: Exception) {
         }
         serverSocket = null
-        synchronized(tcpSlotLock) {
-            currentTcpSlotsUsed = 0
-            tcpSlotLock.notifyAll()
+        synchronized(heavyStreamLock) {
+            activeHeavyStreams = 0
+            heavyStreamLock.notifyAll()
         }
     }
 
@@ -237,6 +240,11 @@ class LocalSocks5Server(
 
             if (foregroundOnlyEnabled && !hasActiveForegroundApp) {
                 blockedCount.incrementAndGet()
+                // تأخير 400ms لكسر عاصفة إعادة المحاولة في الخلفية ومنع استنزاف المعالج والبيانات
+                try {
+                    Thread.sleep(400L)
+                } catch (_: InterruptedException) {
+                }
                 output.write(byteArrayOf(0x05, 0x02, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
                 output.flush()
                 client.close()
@@ -277,15 +285,6 @@ class LocalSocks5Server(
     ) {
         if (!running || client.isClosed) return
 
-        // انتظار توفر مقعد ضمن الحد الأقصى للاتصالات المتزامنة
-        if (!acquireTcpSlot(client)) {
-            try {
-                client.close()
-            } catch (_: Exception) {
-            }
-            return
-        }
-
         val isWebPort = (port == 80 || port == 443)
         val downLimiter = if (isWebPort) webTcpDownLimiter else otherTcpDownLimiter
         val upLimiter = if (isWebPort) webTcpUpLimiter else otherTcpUpLimiter
@@ -293,13 +292,13 @@ class LocalSocks5Server(
 
         val remote = Socket()
         activeSockets.add(remote)
-        try {
-            downLimiter.consume(1500)
+        var promotedToHeavy = false
 
+        try {
             vpnService.protect(remote)
             remote.tcpNoDelay = true
-            remote.receiveBufferSize = 2048
-            remote.sendBufferSize = 2048
+            remote.receiveBufferSize = 4096
+            remote.sendBufferSize = 4096
             remote.soTimeout = 20000
             remote.connect(InetSocketAddress(host, port), 10000)
 
@@ -311,12 +310,16 @@ class LocalSocks5Server(
 
             val upFuture = executor.submit {
                 val buf = ByteArray(1024)
+                var uploadedOnConn = 0L
                 try {
                     while (running && !client.isClosed && !remote.isClosed) {
                         val read = clientIn.read(buf)
                         if (read == -1) break
                         if (read > 0) {
-                            upLimiter.consume(read)
+                            uploadedOnConn += read
+                            if (uploadedOnConn > FAST_START_BYTES) {
+                                upLimiter.consume(read)
+                            }
                             totalUploadBytes.addAndGet(read.toLong())
                             routeCounter.addAndGet(read.toLong())
                             remoteOut.write(buf, 0, read)
@@ -333,12 +336,24 @@ class LocalSocks5Server(
             }
 
             val buf = ByteArray(1024)
+            var downloadedOnConn = 0L
             try {
                 while (running && !client.isClosed && !remote.isClosed) {
                     val read = remoteIn.read(buf)
                     if (read == -1) break
                     if (read > 0) {
-                        downLimiter.consume(read)
+                        downloadedOnConn += read
+
+                        // المرحلة 1: أول 12 KB تمر فوراً لفتح التطبيقات والرسائل دون تعليق
+                        // المرحلة 2: بعد 12 KB يتحول الاتصال لمسار ثقيل (فيديو/ملف) ويخضع للقفل والسرعة
+                        if (downloadedOnConn > FAST_START_BYTES) {
+                            if (!promotedToHeavy) {
+                                if (!acquireHeavyStreamSlot(client, remote)) break
+                                promotedToHeavy = true
+                            }
+                            downLimiter.consume(read)
+                        }
+
                         totalDownloadBytes.addAndGet(read.toLong())
                         routeCounter.addAndGet(read.toLong())
                         clientOut.write(buf, 0, read)
@@ -362,7 +377,9 @@ class LocalSocks5Server(
             } catch (_: Exception) {
             }
         } finally {
-            releaseTcpSlot()
+            if (promotedToHeavy) {
+                releaseHeavyStreamSlot()
+            }
             activeSockets.remove(remote)
             try {
                 remote.close()
@@ -382,8 +399,8 @@ class LocalSocks5Server(
         clientOut: OutputStream
     ) {
         val udpRelay = DatagramSocket(0, InetAddress.getByName("127.0.0.1")).apply {
-            receiveBufferSize = 2048
-            sendBufferSize = 2048
+            receiveBufferSize = 4096
+            sendBufferSize = 4096
         }
         val relayPort = udpRelay.localPort
 
@@ -442,15 +459,12 @@ class LocalSocks5Server(
                         val destPort = ((buf[offset].toInt() and 0xFF) shl 8) or (buf[offset + 1].toInt() and 0xFF)
                         offset += 2
 
-                        // 1. DNS (منفذ 53) يمر دائماً بلا تأخير
                         if (destPort != 53) {
-                            // 2. QUIC / UDP 443
                             if (destPort == 443 && blockQuicUdp443) {
                                 quicBlockedCount.incrementAndGet()
                                 blockedCount.incrementAndGet()
                                 continue
                             }
-                            // 3. المكالمات وباقي UDP
                             if (!tryConsumeCallPacket()) {
                                 blockedCount.incrementAndGet()
                                 continue
