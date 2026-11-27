@@ -481,6 +481,62 @@
                 </LinearLayout>
             </LinearLayout>
 
+            <!-- المسار 5: الحد الأقصى للاتصالات المتزامنة (منع قفزات السرعة) -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:background="#1E1E1E"
+                android:padding="12dp"
+                android:layout_marginBottom="10dp">
+
+                <TextView
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="5. الحد الأقصى للاتصالات المتزامنة (منع القفزات)"
+                    android:textColor="#FFD54F"
+                    android:textSize="14sp"
+                    android:textStyle="bold" />
+
+                <TextView
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="1-2 لمنع القفزات كلياً، 3-4 للتوازن، 0 لفتح الاتصالات بلا حد."
+                    android:textColor="#9E9E9E"
+                    android:textSize="12sp"
+                    android:layout_marginTop="4dp" />
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal"
+                    android:gravity="center_vertical"
+                    android:layout_marginTop="6dp">
+
+                    <TextView
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="عدد الاتصالات المسموحة:"
+                        android:textColor="#CCCCCC"
+                        android:textSize="12sp"
+                        android:layout_marginEnd="8dp" />
+
+                    <EditText
+                        android:id="@+id/etMaxConns"
+                        android:layout_width="80dp"
+                        android:layout_height="38dp"
+                        android:background="#2A2A2A"
+                        android:inputType="number"
+                        android:maxLength="3"
+                        android:gravity="center"
+                        android:text="3"
+                        android:textColor="#FFD54F"
+                        android:textSize="15sp"
+                        android:textStyle="bold"
+                        android:singleLine="true" />
+                </LinearLayout>
+            </LinearLayout>
+
             <!-- زر حفظ وتطبيق إعدادات المنافذ فوراً -->
             <com.google.android.material.button.MaterialButton
                 android:id="@+id/btnApplyPorts"
