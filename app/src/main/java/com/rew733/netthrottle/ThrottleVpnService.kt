@@ -90,9 +90,9 @@ class ThrottleVpnService : VpnService() {
     }
 
     private var vpnInterface: ParcelFileDescriptor? = null
-    private val downloadLimiter = TokenBucketLimiter(40 * 1024L)
-    private val uploadLimiter = TokenBucketLimiter(40 * 1024L)
-    private val udpLimiter = TokenBucketLimiter(20 * 1024L)
+    private val downloadLimiter = TokenBucketLimiter(50 * 1024L)
+    private val uploadLimiter = TokenBucketLimiter(50 * 1024L)
+    private val udpLimiter = TokenBucketLimiter(10 * 1024L)
     private var socksServer: LocalSocks5Server? = null
     private var currentKbps: Int = 60
     private var routingModeDesc: String = ""
@@ -142,8 +142,8 @@ class ThrottleVpnService : VpnService() {
 
     private fun applySpeedLimits(kbps: Int) {
         val totalBytes = kbps * 1024L
-        val tcpBytes = (totalBytes * 0.65).toLong().coerceAtLeast(1024L)
-        val udpBytes = (totalBytes * 0.35).toLong().coerceAtLeast(1024L)
+        val tcpBytes = (totalBytes * 0.85).toLong().coerceAtLeast(1024L)
+        val udpBytes = (totalBytes * 0.15).toLong().coerceAtLeast(512L)
         downloadLimiter.updateRate(tcpBytes)
         uploadLimiter.updateRate(tcpBytes)
         udpLimiter.updateRate(udpBytes)
@@ -320,6 +320,9 @@ class ThrottleVpnService : VpnService() {
                 .setMtu(1500)
                 .addAddress("10.0.0.2", 32)
                 .addRoute("0.0.0.0", 0)
+                // سد ثغرة IPv6 بالكامل لمنع هروب فيسبوك ويوتيوب وتيك توك خارج النفق
+                .addAddress("fd00:1:fd00:1:fd00:1:fd00:1", 128)
+                .addRoute("::", 0)
                 .addDnsServer("8.8.8.8")
                 .addDnsServer("1.1.1.1")
 
@@ -370,6 +373,7 @@ class ThrottleVpnService : VpnService() {
                   mtu: 1500
                   multi-queue: false
                   ipv4: 10.0.0.2
+                  ipv6: 'fd00:1:fd00:1:fd00:1:fd00:1'
                 socks5:
                   port: ${server.port}
                   address: 127.0.0.1
